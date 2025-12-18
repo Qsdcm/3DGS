@@ -1,84 +1,64 @@
 #!/bin/bash
-# train.sh - 3D Gaussian Splatting MRI Reconstruction Training Script
-# Example run (pt1.10): GPU=1 DATA=/data/data54/wanghaobo/data/ksp_full.h5 OUT=./outputs ITERS=5000 bash train.sh
+# train.sh - 3D Gaussian Splatting MRI Reconstruction (Single GPU Version)
 #
-# Usage (single GPU):
+# Usage:
 #   bash train.sh
-#
-# Usage (multi-GPU):
-#   MULTI_GPU=1 bash train.sh
 
 # ============================================================================
-# Configuration - Modify these variables
+# Configuration
 # ============================================================================
 
-# GPU settings
-GPU=${GPU:-0}                          # GPU ID for single-GPU training
-NGPU=${NGPU:-4}                        # Number of GPUs for multi-GPU training
-MULTI_GPU=${MULTI_GPU:-0}              # Set to 1 to enable multi-GPU
+# 1. GPU 设置 (指定单卡，例如使用第0号卡)
+GPU=3
 
-# Data paths
-DATA=${DATA:-/path/to/data}            # H5 file or directory containing H5 files
-OUT=${OUT:-./outputs}                  # Output directory
+# 2. 数据路径 (已修改为您提供的真实路径)
+DATA="/data/data54/wanghaobo/data/ksp_full.h5"
 
-# Training settings
-ITERS=${ITERS:-2000}                   # Maximum optimization iterations
-N_GAUSSIANS=${N_GAUSSIANS:-1000}       # Initial number of Gaussians
+# 3. 输出目录
+OUT="./results_single_gpu"
 
-# Data-related hyperparameters
-ACC=${ACC:-4.0}                        # Acceleration factor
-MASK_TYPE=${MASK_TYPE:-gaussian}       # Mask type: gaussian or uniform
-CENTER_FRAC=${CENTER_FRAC:-0.08}       # Center fraction for ACS
-
-# Optional: Additional arguments
-EXTRA_ARGS=${EXTRA_ARGS:-""}           # Any additional arguments
+# 4. 关键超参数 (根据优化建议调整，确保能训练出图像)
+# 初始高斯点数 (调大以覆盖主体)
+N_GAUSSIANS=50000
+# 初始亮度系数 (调大以防止初始全黑)
+K_INIT=10.0
+# 密度学习率 (调大以加快收敛)
+LR_RHO=0.05
+# 中心点学习率
+LR_CENTERS=0.003
+# 加速倍数
+ACC=4.0
 
 # ============================================================================
 # Run Training
 # ============================================================================
 
 echo "=============================================="
-echo "3DGS MRI Reconstruction - Training"
+echo "3DGS MRI Reconstruction - Single GPU Training"
 echo "=============================================="
+echo "GPU: $GPU"
 echo "Data: $DATA"
 echo "Output: $OUT"
-echo "Iterations: $ITERS"
-echo "Initial Gaussians: $N_GAUSSIANS"
-echo "Acceleration: ${ACC}x"
-echo "Mask Type: $MASK_TYPE"
+echo "Params: N_Gaussians=$N_GAUSSIANS, K_Init=$K_INIT, LR_Rho=$LR_RHO"
 echo "=============================================="
 
-if [ "$MULTI_GPU" -eq 1 ]; then
-    echo "Mode: Multi-GPU ($NGPU GPUs)"
-    echo "=============================================="
-    
-    CUDA_VISIBLE_DEVICES=$GPU torchrun \
-        --nproc_per_node=$NGPU \
-        train.py \
-        --data_root "$DATA" \
-        --out_root "$OUT" \
-        --max_iters $ITERS \
-        --n_gaussians $N_GAUSSIANS \
-        --acceleration $ACC \
-        --mask_type $MASK_TYPE \
-        --center_fraction $CENTER_FRAC \
-        --distributed 1 \
-        $EXTRA_ARGS
-else
-    echo "Mode: Single-GPU (GPU $GPU)"
-    echo "=============================================="
-    
-    CUDA_VISIBLE_DEVICES=$GPU python train.py \
-        --data_root "$DATA" \
-        --out_root "$OUT" \
-        --max_iters $ITERS \
-        --n_gaussians $N_GAUSSIANS \
-        --acceleration $ACC \
-        --mask_type $MASK_TYPE \
-        --center_fraction $CENTER_FRAC \
-        $EXTRA_ARGS
-fi
+# 确保脚本遇到错误即停止
+set -e
+
+# 运行命令 (使用 python 直接运行，避开 torchrun 的复杂性)
+CUDA_VISIBLE_DEVICES=$GPU python train.py \
+    --data_root "$DATA" \
+    --out_root "$OUT" \
+    --n_gaussians $N_GAUSSIANS \
+    --k_init $K_INIT \
+    --lr_rho $LR_RHO \
+    --lr_centers $LR_CENTERS \
+    --acceleration $ACC \
+    --mask_type gaussian \
+    --max_iters 3000 \
+    --densify_every 300 \
+    --vis_every 100 \
+    --print_every 50
 
 echo ""
-echo "Training complete!"
-echo "Results saved to: $OUT"
+echo "Training complete! Results saved to: $OUT"

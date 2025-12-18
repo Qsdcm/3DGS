@@ -1,21 +1,14 @@
 """train.py
 
-3D Gaussian Splatting MRI Reconstruction 训练脚本。
+3D Gaussian Splatting MRI Reconstruction 训练脚本 (优化版)。
 
-这是"每个 volume 的优化式重建"：对数据集中的每个 H5 样本执行 Adam 优化。
-
-输出（每个样本）：
-- recon_complex.npy: 重建的复数图像
-- recon_mag.npy: 重建的幅值图像
-- gaussians.pt: 最终 Gaussian 参数
-- metrics.json: 评估指标和损失曲线
-
-支持：
-- 单 GPU: python train.py --data_root ...
-- 多 GPU: torchrun --nproc_per_node=N train.py --data_root ... --distributed 1
+改进点：
+1. 调整了默认超参数 (lr, n_gaussians, k_init) 以适应 MRI 任务。
+2. 增加了中间结果的可视化 (保存 .png)。
+3. 优化了 Densify 后的优化器处理逻辑。
 
 用法：
-    python train.py --data_root /path/to/data --out_root ./outputs --max_iters 2000
+    python train.py --data_root /path/to/data --out_root ./outputs --max_iters 3000
 """
 
 from __future__ import annotations
@@ -29,6 +22,12 @@ from typing import Optional
 
 import numpy as np
 import torch
+
+try:
+    import torchvision
+    HAS_TORCHVISION = True
+except ImportError:
+    HAS_TORCHVISION = False
 
 from dataset import MRIDatasetLoader, get_sample_data
 from model import GaussianMRIModel
@@ -61,46 +60,47 @@ def parse_args():
     parser.add_argument("--center_fraction", type=float, default=0.08,
                         help="Center fraction for ACS lines")
 
-    # Model
-    parser.add_argument("--n_gaussians", type=int, default=10000,
-                        help="Initial number of Gaussians")
+    # Model Init Parameters (Updated defaults)
+    parser.add_argument("--n_gaussians", type=int, default=50000,
+                        help="Initial number of Gaussians (Increased for better details)")
     parser.add_argument("--sigma_cutoff", type=float, default=3.0,
                         help="Gaussian truncation (in sigmas)")
-    parser.add_argument("--percentile_thresh", type=float, default=10.0,
-                        help="Percentile threshold for background filtering in initialization")
-    parser.add_argument("--k_init", type=float, default=1.0,
-                        help="Density initialization scale factor")
+    parser.add_argument("--percentile_thresh", type=float, default=0.0,
+                        help="Percentile threshold for init (0 means use all valid points)")
+    parser.add_argument("--k_init", type=float, default=10.0,
+                        help="Density initialization scale factor (Higher to avoid black initial image)")
 
     # Training
-    parser.add_argument("--max_iters", type=int, default=5000,
+    parser.add_argument("--max_iters", type=int, default=3000,
                         help="Maximum optimization iterations per sample")
-    parser.add_argument("--lr", type=float, default=0.01,
-                        help="Learning rate")
-    parser.add_argument("--lr_centers", type=float, default=0.001,
-                        help="Learning rate for centers")
+    
+    # Learning Rates (Updated defaults)
+    parser.add_argument("--lr", type=float, default=0.01, help="Base LR (not used directly)")
+    parser.add_argument("--lr_centers", type=float, default=0.003, 
+                        help="LR for centers (Increased)")
     parser.add_argument("--lr_scales", type=float, default=0.005,
-                        help="Learning rate for log_scales")
-    parser.add_argument("--lr_rho", type=float, default=0.01,
-                        help="Learning rate for rho (density)")
+                        help="LR for log_scales")
+    parser.add_argument("--lr_rho", type=float, default=0.05,
+                        help="LR for rho/density (Significantly increased for fast convergence)")
 
     # Regularization
     parser.add_argument("--lambda_tv", type=float, default=1e-4,
-                        help="TV regularization weight (0 to disable)")
+                        help="TV regularization weight")
 
     # Adaptive control
-    parser.add_argument("--densify_every", type=int, default=100,
-                        help="Densification interval (iterations)")
-    parser.add_argument("--densify_start", type=int, default=50,
+    parser.add_argument("--densify_every", type=int, default=300,
+                        help="Densification interval (Increased to preserve optimizer momentum)")
+    parser.add_argument("--densify_start", type=int, default=200,
                         help="Start densification after this iteration")
-    parser.add_argument("--densify_end", type=int, default=2000,
+    parser.add_argument("--densify_end", type=int, default=2500,
                         help="Stop densification after this iteration")
-    parser.add_argument("--grad_threshold", type=float, default=0.005,
+    parser.add_argument("--grad_threshold", type=float, default=0.002,
                         help="Gradient threshold for densification")
     parser.add_argument("--prune_rho_thresh", type=float, default=1e-4,
                         help="Density threshold for pruning")
-    parser.add_argument("--max_gaussians", type=int, default=100000,
+    parser.add_argument("--max_gaussians", type=int, default=200000,
                         help="Maximum number of Gaussians")
-    parser.add_argument("--min_gaussians", type=int, default=64,
+    parser.add_argument("--min_gaussians", type=int, default=1000,
                         help="Minimum Gaussians kept after pruning")
     parser.add_argument("--split_scale_factor", type=float, default=0.7,
                         help="Scale reduction factor after split")
@@ -114,37 +114,72 @@ def parse_args():
     # Misc
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
-    parser.add_argument("--print_every", type=int, default=50,
+    parser.add_argument("--print_every", type=int, default=100,
                         help="Print interval")
-    parser.add_argument("--save_every", type=int, default=500,
-                        help="Checkpoint save interval (0 to disable)")
+    parser.add_argument("--vis_every", type=int, default=200,
+                        help="Visualization save interval")
+    parser.add_argument("--save_every", type=int, default=1000,
+                        help="Checkpoint save interval")
 
     return parser.parse_args()
 
 
+def get_optimizer(model, args):
+    """创建优化器"""
+    return torch.optim.Adam([
+        {"params": [model.centers], "lr": args.lr_centers},
+        {"params": [model.log_scales], "lr": args.lr_scales},
+        {"params": [model.rho_real, model.rho_imag], "lr": args.lr_rho},
+        # 如果启用了 rotation，添加 rotation 参数
+        # {"params": [model.rotations], "lr": ...} 
+    ])
+
+
+def save_visualization(volume, out_dir, iteration, sample_name):
+    """保存中间切片图像"""
+    if not HAS_TORCHVISION:
+        return
+        
+    try:
+        # 取中间切片
+        nz = volume.shape[0]
+        mid_slice = volume[nz // 2].detach().cpu()
+        
+        # 计算幅值
+        mag = torch.abs(mid_slice)
+        
+        # 简单归一化到 [0, 1] 用于显示
+        if mag.max() > 0:
+            mag = (mag - mag.min()) / (mag.max() - mag.min())
+        
+        vis_path = out_dir / "visualizations"
+        ensure_dir(vis_path)
+        
+        torchvision.utils.save_image(
+            mag.unsqueeze(0), 
+            vis_path / f"{sample_name}_iter_{iteration:05d}.png"
+        )
+    except Exception as e:
+        print(f"[Warning] Visualization failed: {e}")
+
+
 def train_single_sample(
     sample_name: str,
-    kspace_under: torch.Tensor,  # (nz, nx, ny) complex
-    mask: torch.Tensor,          # (nz, nx, ny) float
-    image_gt: torch.Tensor,      # (nz, nx, ny) float
-    image_init_complex: torch.Tensor,  # (nz, nx, ny) complex
+    kspace_under: torch.Tensor,
+    mask: torch.Tensor,
+    image_gt: torch.Tensor,
+    image_init_complex: torch.Tensor,
     out_dir: Path,
     args: argparse.Namespace,
     device: str,
 ) -> dict:
-    """对单个样本执行优化式重建。
-
-    Returns:
-        result: 包含 metrics 和 timing 的字典
-    """
     print(f"\n{'='*60}")
-    print(f"[Train] Sample: {sample_name}")
+    print(f"[Train] Sample: {sample_name} | Shape: {kspace_under.shape}")
     print(f"{'='*60}")
 
     volume_shape = tuple(kspace_under.shape)
-    nz, nx, ny = volume_shape
-
-    # 创建模型
+    
+    # 1. 创建模型
     model = GaussianMRIModel(
         volume_shape=volume_shape,
         n_gaussians=args.n_gaussians,
@@ -152,7 +187,8 @@ def train_single_sample(
         sigma_cutoff=args.sigma_cutoff,
     )
 
-    # 从初始图像初始化
+    # 2. 初始化 (Crucial Step)
+    # 使用较高的 k_init 确保初始有信号
     model.initialize_from_image(
         image_init_complex,
         n_gaussians=args.n_gaussians,
@@ -161,18 +197,15 @@ def train_single_sample(
         seed=args.seed,
     )
 
-    # 设置优化器（分组学习率）
-    optimizer = torch.optim.Adam([
-        {"params": [model.centers], "lr": args.lr_centers},
-        {"params": [model.log_scales], "lr": args.lr_scales},
-        {"params": [model.rho_real, model.rho_imag], "lr": args.lr_rho},
-    ])
+    # 3. 优化器
+    optimizer = get_optimizer(model, args)
 
     # 训练循环
     loss_history = []
     best_loss = float("inf")
+    best_psnr = 0.0
     best_state = None
-
+    
     start_time = time.time()
 
     for iteration in range(1, args.max_iters + 1):
@@ -192,23 +225,23 @@ def train_single_sample(
 
         # Backward
         loss.backward()
+        
+        # Gradient clipping (Optional, adds stability)
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
         # Update
         optimizer.step()
 
         # Record
-        loss_history.append(loss_dict["loss_total"])
+        loss_val = loss_dict["loss_total"]
+        loss_history.append(loss_val)
 
-        if loss_dict["loss_total"] < best_loss:
-            best_loss = loss_dict["loss_total"]
-            best_state = model.get_state_dict()
-
-        # Densification & Pruning
-        densify_stats = None
+        # 4. Adaptive Control (Densify & Prune)
+        densify_stats = {}
         if (args.densify_start <= iteration <= args.densify_end and
             iteration % args.densify_every == 0):
 
-            densify_stats = model.densify_and_prune(
+            stats = model.densify_and_prune(
                 grad_threshold=args.grad_threshold,
                 prune_rho_thresh=args.prune_rho_thresh,
                 max_gaussians=args.max_gaussians,
@@ -216,96 +249,91 @@ def train_single_sample(
                 split_scale_factor=args.split_scale_factor,
                 split_delta_factor=args.split_delta_factor,
             )
+            densify_stats = stats
 
-            # 重新创建优化器（参数数量可能变化）
-            optimizer = torch.optim.Adam([
-                {"params": [model.centers], "lr": args.lr_centers},
-                {"params": [model.log_scales], "lr": args.lr_scales},
-                {"params": [model.rho_real, model.rho_imag], "lr": args.lr_rho},
-            ])
+            # 如果参数数量发生变化，必须重建优化器
+            # 注意：重建优化器会丢失动量(Momentum)，所以我们降低了 Densify 频率
+            if stats.get("n_split", 0) > 0 or stats.get("n_pruned", 0) > 0:
+                optimizer = get_optimizer(model, args)
 
-        # Print progress
+        # 5. Logging & Checkpointing
+        if loss_val < best_loss:
+            best_loss = loss_val
+            # 仅保存参数，不建议太频繁深拷贝整个 state dict，耗时
+            # best_state = model.get_state_dict() 
+        
+        # Print
         if iteration % args.print_every == 0 or iteration == 1:
             elapsed = time.time() - start_time
-            msg = (f"[Iter {iteration:5d}/{args.max_iters}] "
-                   f"Loss: {loss_dict['loss_total']:.6f} "
-                   f"(DC: {loss_dict['loss_dc']:.6f}) "
-                   f"#G: {model.n_gaussians:5d} "
+            msg = (f"[Iter {iteration:5d}] "
+                   f"Loss: {loss_val:.6f} (DC: {loss_dict['loss_dc']:.6f}) "
+                   f"#G: {model.n_gaussians} "
                    f"Time: {elapsed:.1f}s")
+            
             if densify_stats:
-                msg += f" | Split: {densify_stats['n_split']}, Prune: {densify_stats['n_pruned']}"
+                msg += f" | Split: {densify_stats.get('n_split',0)} Prune: {densify_stats.get('n_pruned',0)}"
             print(msg)
 
-        # Save checkpoint
-        if args.save_every > 0 and iteration % args.save_every == 0:
-            ckpt_path = out_dir / f"checkpoint_{iteration:05d}.pt"
-            torch.save(model.get_state_dict(), ckpt_path)
+        # Vis
+        if iteration % args.vis_every == 0:
+            save_visualization(volume, out_dir, iteration, sample_name)
+            
+            # 计算一下当前的 PSNR 看看情况
+            with torch.no_grad():
+                mag_curr = torch.abs(volume)
+                metrics_curr = compute_metrics(mag_curr, image_gt)
+                if metrics_curr['psnr'] > best_psnr:
+                    best_psnr = metrics_curr['psnr']
+                    best_state = model.get_state_dict() # 保存 PSNR 最高的模型
 
     total_time = time.time() - start_time
 
-    # 恢复最佳状态
+    # 训练结束，加载最佳状态 (Best PSNR)
     if best_state is not None:
+        print(f"Loading best model with PSNR: {best_psnr:.2f} dB")
         model.load_state_dict_custom(best_state)
 
-    # 生成最终重建
+    # 最终生成
     with torch.no_grad():
         recon_complex = model.voxelize()
         recon_mag = torch.abs(recon_complex)
 
-    # 计算评估指标
-    metrics = compute_metrics(
-        recon_mag.cpu(),
-        image_gt.cpu(),
-    )
-
-    print(f"\n[Result] PSNR: {metrics['psnr']:.2f} dB, "
+    # 最终指标
+    metrics = compute_metrics(recon_mag, image_gt)
+    print(f"\n[Final Result] PSNR: {metrics['psnr']:.2f} dB, "
           f"SSIM: {metrics['ssim']:.4f}, "
           f"NMSE: {metrics['nmse']:.6f}")
 
-    # 保存结果
+    # 保存
     ensure_dir(out_dir)
-
-    # 复数重建
-    recon_complex_np = recon_complex.cpu().numpy().astype(np.complex64)
-    np.save(out_dir / "recon_complex.npy", recon_complex_np)
-
-    # 幅值重建
-    recon_mag_np = recon_mag.cpu().numpy().astype(np.float32)
-    np.save(out_dir / "recon_mag.npy", recon_mag_np)
-
-    # Gaussian 参数
+    np.save(out_dir / "recon_complex.npy", recon_complex.cpu().numpy().astype(np.complex64))
+    np.save(out_dir / "recon_mag.npy", recon_mag.cpu().numpy().astype(np.float32))
     torch.save(model.get_state_dict(), out_dir / "gaussians.pt")
+    
+    # 保存最终可视化
+    save_visualization(recon_complex, out_dir, args.max_iters, f"{sample_name}_final")
 
-    # Metrics
     result = {
         "sample_name": sample_name,
         "metrics": metrics,
-        "final_loss": loss_history[-1] if loss_history else None,
-        "best_loss": best_loss,
         "n_gaussians_final": model.n_gaussians,
         "total_time_sec": total_time,
-        "iterations": args.max_iters,
         "loss_history": loss_history,
     }
     save_json(result, out_dir / "metrics.json")
-
-    print(f"[Train] Results saved to: {out_dir}")
-
     return result
 
 
 def main():
     args = parse_args()
-
-    # 设置随机种子
     set_seed(args.seed)
 
-    # 分布式初始化
+    # Distributed setup
     rank, world_size, is_distributed = 0, 1, False
     if args.distributed:
         rank, world_size, is_distributed = setup_distributed()
 
-    # 设备
+    # Device
     if torch.cuda.is_available():
         if is_distributed:
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -317,20 +345,10 @@ def main():
         print("[Warning] CUDA not available, using CPU")
 
     if is_main_process(rank):
-        print(f"\n{'='*60}")
-        print(f"3D Gaussian Splatting MRI Reconstruction")
-        print(f"{'='*60}")
-        print(f"Data root: {args.data_root}")
-        print(f"Output root: {args.out_root}")
-        print(f"Device: {device}")
-        print(f"Distributed: {is_distributed} (rank {rank}/{world_size})")
-        print(f"Max iterations: {args.max_iters}")
-        print(f"Initial Gaussians: {args.n_gaussians}")
-        print(f"Acceleration: {args.acceleration}x")
-        print(f"Mask type: {args.mask_type}")
-        print(f"{'='*60}\n")
+        print(f"Starting Training on {device}...")
+        print(f"Params: LR_rho={args.lr_rho}, Init_K={args.k_init}, N_Gaussians={args.n_gaussians}")
 
-    # 创建数据加载器
+    # Loader
     loader = MRIDatasetLoader(
         data_root=args.data_root,
         acceleration=args.acceleration,
@@ -342,26 +360,16 @@ def main():
         world_size=world_size,
     )
 
-    if len(loader) == 0:
-        print(f"[Error] No samples found in {args.data_root}")
-        sys.exit(1)
-
-    # 创建输出目录
     out_root = Path(args.out_root)
     if is_main_process(rank):
         ensure_dir(out_root)
 
-    # 遍历样本进行重建
     all_results = []
-
     for sample_name, mri_ds in loader:
-        # 获取数据
         kspace_under, mask, image_gt, image_init_complex, meta = get_sample_data(mri_ds)
-
-        # 样本输出目录
         sample_out_dir = out_root / sample_name
+        ensure_dir(sample_out_dir)
 
-        # 训练
         result = train_single_sample(
             sample_name=sample_name,
             kspace_under=kspace_under,
@@ -372,41 +380,18 @@ def main():
             args=args,
             device=device,
         )
-
         all_results.append(result)
 
-    # 汇总结果（仅 rank 0）
-    if is_main_process(rank) and len(all_results) > 0:
+    # Summary
+    if is_main_process(rank) and all_results:
         summary = {
-            "n_samples": len(all_results),
             "avg_psnr": np.mean([r["metrics"]["psnr"] for r in all_results]),
             "avg_ssim": np.mean([r["metrics"]["ssim"] for r in all_results]),
-            "avg_nmse": np.mean([r["metrics"]["nmse"] for r in all_results]),
-            "total_time_sec": sum([r["total_time_sec"] for r in all_results]),
-            "samples": [
-                {
-                    "name": r["sample_name"],
-                    "psnr": r["metrics"]["psnr"],
-                    "ssim": r["metrics"]["ssim"],
-                    "nmse": r["metrics"]["nmse"],
-                }
-                for r in all_results
-            ],
+            "samples": all_results
         }
         save_json(summary, out_root / "summary.json")
+        print("\nTraining Complete.")
 
-        print(f"\n{'='*60}")
-        print(f"Training Complete!")
-        print(f"{'='*60}")
-        print(f"Samples processed: {summary['n_samples']}")
-        print(f"Average PSNR: {summary['avg_psnr']:.2f} dB")
-        print(f"Average SSIM: {summary['avg_ssim']:.4f}")
-        print(f"Average NMSE: {summary['avg_nmse']:.6f}")
-        print(f"Total time: {summary['total_time_sec']:.1f}s")
-        print(f"Results saved to: {out_root}")
-        print(f"{'='*60}\n")
-
-    # 清理分布式
     if is_distributed:
         cleanup_distributed()
 

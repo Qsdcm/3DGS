@@ -93,3 +93,11 @@ __pycache__/dataset.cpython-310.pyc
 __pycache__/model.cpython-310.pyc
 __pycache__/utils.cpython-310.pyc
 requirements.txt
+__pycache__/data_read.cpython-38.pyc
+__pycache__/dataset.cpython-38.pyc
+__pycache__/model.cpython-38.pyc
+__pycache__/utils.cpython-38.pyc
+results_single_gpu/ksp_full/visualizations/ksp_full_iter_00100.png
+results_single_gpu/ksp_full/visualizations/ksp_full_iter_00200.png
+results_single_gpu/ksp_full/visualizations/ksp_full_iter_00300.png
+results_single_gpu/ksp_full/visualizations/ksp_full_iter_00400.png
