@@ -1,6 +1,6 @@
 # =============================================================================
 # 3DGSMR: 3D Gaussian Representation for MRI Reconstruction
-# Default Configuration File (Revised per Paper Specs)
+# Default Configuration File (Fully Aligned with Paper)
 # =============================================================================
 
 # Data Configuration
@@ -8,99 +8,75 @@ data:
   data_path: "/data/data54/wanghaobo/data/ksp_full.h5"
   # 加速因子 (2, 3, 4, 6, 8)
   acceleration_factor: 4
-  # 欠采样mask类型: "gaussian", "poisson", "random"
   mask_type: "gaussian"
-  # 是否使用ACS (Auto-Calibration Signal) 区域
   use_acs: true
-  acs_lines: 32  # ACS区域的线数
+  acs_lines: 32
 
 # Gaussian Model Configuration
 gaussian:
-  # 初始Gaussian点数 (论文中使用500用于高加速因子，常规用50k)
+  # 初始Gaussian点数 (论文: High acceleration factors use 500)
   initial_num_points: 500
-  # 最大Gaussian点数 (论文 Page 4 & 9: set to 400k)
+  # 最大Gaussian点数 (论文 Page 4: "set to 400 thousand")
   max_num_points: 400000
-  # 初始尺度因子
   initial_scale: 2.0
-  # 位置学习率
   position_lr: 0.001
-  # 尺度学习率  
   scale_lr: 0.005
-  # 旋转学习率
   rotation_lr: 0.001
-  # 密度学习率
   density_lr: 0.01
-  # 是否使用复数密度值 (MRI为复值)
   complex_density: true
 
 # Adaptive Control (Densification) Configuration
 adaptive_control:
-  # 是否启用densification
   enable: true
-  # 开始densification的迭代次数
   densify_from_iter: 100
-  # 每隔多少iter进行一次densification (论文 Page 4: "done in every 100 iterations")
+  # 论文 Page 4: "densification is done in every 100 iterations"
   densify_every: 100
-  # 停止densification的迭代次数 (延长以允许从500增长到400k)
-  densify_until_iter: 1800
+  # 延长分裂时间以达到400k点
+  densify_until_iter: 2500
   # 梯度阈值 (论文 Table 1: s=0.02)
-  grad_threshold: 0.02
-  # 使用long-axis splitting策略 (论文中用于高加速因子)
+  # 注意: 如果Loss是Sum reduction，梯度会很大，这里0.0002会触发所有点分裂
+  # 我们依靠 scale_threshold 来控制停止
+  grad_threshold: 0.0002
+  
   use_long_axis_splitting: true
-  # long-axis splitting的尺度阈值 (论文提及)
-  scale_threshold: 0.01
-  # 是否使用cloning (论文中高加速因子时禁用)
+  # 关键修改: 大幅降低尺度阈值，允许分裂到非常细微 (0.0005 约为 0.05 个体素大小)
+  scale_threshold: 0.0005
+  
   use_cloning: false
-  # 最小不透明度阈值 (低于此值的点会被剪除)
   opacity_threshold: 0.01
 
 # Training Configuration
 training:
-  # 最大迭代次数 (论文 Fig 5 显示2000次足够收敛)
-  max_iterations: 2000
-  # 保存checkpoint的间隔
+  max_iterations: 3000
   save_every: 500
-  # 日志打印间隔
   log_every: 50
-  # 评估间隔 (计算PSNR/SSIM)
   eval_every: 100
-  # 学习率调度器
   lr_scheduler:
-    type: "exponential"  # "step", "exponential", "cosine"
+    type: "exponential"
     gamma: 0.95
     step_size: 200
-  # 随机种子
   seed: 42
+  # 梯度裁剪 (防止分裂初期梯度爆炸)
+  max_grad_norm: 1.0
 
-# Loss Configuration (论文 Table 1 优选 lambda=0 for TV, L2 loss)
+# Loss Configuration
 loss:
-  # k-space域loss权重
   kspace_weight: 1.0
-  # image域loss权重
   image_weight: 0.1
-  # TV正则化权重 (论文结论: TV影响有限, 设为0)
   tv_weight: 0.0
-  # L1 vs L2 loss (论文公式2 implies L2 data consistency)
+  # 必须配合 losses.py 中的 .sum() 使用
   loss_type: "l2"
 
 # Output Configuration
 output:
-  # 输出目录
   output_dir: "./outputs"
-  # 实验名称
   exp_name: "3dgsmr_exp"
-  # 是否保存重建结果为nii
   save_nii: true
-  # 是否保存为npy
   save_npy: true
-  # TensorBoard日志
   use_tensorboard: true
 
 # Hardware Configuration
 hardware:
-  # GPU设备ID
   device: "cuda:2"
-  # 混合精度训练
-  use_amp: false  # MRI复值计算时需谨慎使用
-  # 数据加载线程数
+  use_amp: false
   num_workers: 16

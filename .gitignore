@@ -38,3 +38,7 @@ gsmr3d/__pycache__/metrics.cpython-310.pyc
 3dgsVC/outputs/checkpoints/best.pth
 3dgsVC/outputs/checkpoints/best.pth
 3dgsVC/outputs/checkpoints/best.pth
+3dgsVC/outputs/acc4_pts501_seed42/config.yaml
+3dgsVC/outputs/acc4_pts501_seed42/checkpoints/best.pth
+3dgsVC/outputs/acc4_pts501_seed42/checkpoints/checkpoint_000000.pth
+3dgsVC/outputs/acc4_pts501_seed42/checkpoints/latest.pth
