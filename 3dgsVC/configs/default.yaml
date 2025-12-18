@@ -1,6 +1,6 @@
 # =============================================================================
 # 3DGSMR: 3D Gaussian Representation for MRI Reconstruction
-# Default Configuration File
+# Default Configuration File (Revised per Paper Specs)
 # =============================================================================
 
 # Data Configuration
@@ -16,10 +16,10 @@ data:
 
 # Gaussian Model Configuration
 gaussian:
-  # 初始Gaussian点数 (论文中使用500用于高加速因子)
+  # 初始Gaussian点数 (论文中使用500用于高加速因子，常规用50k)
   initial_num_points: 500
-  # 最大Gaussian点数 (用于densification)
-  max_num_points: 50000  # 简化版本,论文中用400k-800k
+  # 最大Gaussian点数 (论文 Page 4 & 9: set to 400k)
+  max_num_points: 400000
   # 初始尺度因子
   initial_scale: 2.0
   # 位置学习率
@@ -39,15 +39,15 @@ adaptive_control:
   enable: true
   # 开始densification的迭代次数
   densify_from_iter: 100
-  # 每隔多少iter进行一次densification
-  densify_every: 50
-  # 停止densification的迭代次数
-  densify_until_iter: 1000
-  # 梯度阈值用于判断是否需要densify
-  grad_threshold: 0.0002
+  # 每隔多少iter进行一次densification (论文 Page 4: "done in every 100 iterations")
+  densify_every: 100
+  # 停止densification的迭代次数 (延长以允许从500增长到400k)
+  densify_until_iter: 1800
+  # 梯度阈值 (论文 Table 1: s=0.02)
+  grad_threshold: 0.02
   # 使用long-axis splitting策略 (论文中用于高加速因子)
   use_long_axis_splitting: true
-  # long-axis splitting的尺度阈值
+  # long-axis splitting的尺度阈值 (论文提及)
   scale_threshold: 0.01
   # 是否使用cloning (论文中高加速因子时禁用)
   use_cloning: false
@@ -56,7 +56,7 @@ adaptive_control:
 
 # Training Configuration
 training:
-  # 最大迭代次数
+  # 最大迭代次数 (论文 Fig 5 显示2000次足够收敛)
   max_iterations: 2000
   # 保存checkpoint的间隔
   save_every: 500
@@ -72,16 +72,16 @@ training:
   # 随机种子
   seed: 42
 
-# Loss Configuration
+# Loss Configuration (论文 Table 1 优选 lambda=0 for TV, L2 loss)
 loss:
   # k-space域loss权重
   kspace_weight: 1.0
   # image域loss权重
   image_weight: 0.1
-  # TV正则化权重 (论文中发现对MRI影响有限,可设为0)
+  # TV正则化权重 (论文结论: TV影响有限, 设为0)
   tv_weight: 0.0
-  # L1 vs L2 loss
-  loss_type: "l2"  # "l1" or "l2"
+  # L1 vs L2 loss (论文公式2 implies L2 data consistency)
+  loss_type: "l2"
 
 # Output Configuration
 output:

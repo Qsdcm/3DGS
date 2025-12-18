@@ -1,5 +1,5 @@
 """
-3DGSMR Trainer (Fixed Config Keys)
+3DGSMR Trainer (Corrected per Paper)
 
 完整的训练流程:
 1. 初始化3D Gaussians (从零填充重建或随机)
@@ -79,7 +79,7 @@ class GaussianTrainer:
             acceleration_factor=data_config['acceleration_factor'],
             mask_type=data_config.get('mask_type', 'gaussian'),
             use_acs=data_config.get('use_acs', True),
-            acs_lines=int(data_config.get('center_fraction', 0.08) * 256)  # 转换center_fraction为acs_lines
+            acs_lines=int(data_config.get('center_fraction', 0.08) * 256)
         )
         
         # 获取数据
@@ -112,7 +112,7 @@ class GaussianTrainer:
             self.gaussian_model = GaussianModel3D.from_image(
                 image=self.zero_filled,
                 num_points=gaussian_config['initial_num_points'],
-                initial_scale=gaussian_config.get('initial_scale', 2.0), # Fixed key: init_scale -> initial_scale
+                initial_scale=gaussian_config.get('initial_scale', 2.0),
                 device=str(self.device)
             )
         else:  # random
@@ -120,7 +120,7 @@ class GaussianTrainer:
             self.gaussian_model = GaussianModel3D(
                 num_points=gaussian_config['initial_num_points'],
                 volume_shape=tuple(self.volume_shape),
-                initial_scale=gaussian_config.get('initial_scale', 2.0), # Fixed key
+                initial_scale=gaussian_config.get('initial_scale', 2.0),
                 device=str(self.device)
             )
         
@@ -150,7 +150,7 @@ class GaussianTrainer:
         
         # 获取可优化参数
         params = self.gaussian_model.get_optimizable_params(
-            lr_position=gaussian_config.get('position_lr', 1e-4), # Fixed: Use gaussian config keys
+            lr_position=gaussian_config.get('position_lr', 1e-4),
             lr_density=gaussian_config.get('density_lr', 1e-3),
             lr_scale=gaussian_config.get('scale_lr', 5e-4),
             lr_rotation=gaussian_config.get('rotation_lr', 1e-4)
@@ -194,10 +194,8 @@ class GaussianTrainer:
         """
         前向传播: Gaussians -> Volume -> K-space
         """
-        # 获取Gaussian参数 (兼容新旧接口)
         positions = self.gaussian_model.positions
         
-        # 尝试使用 get_scales / get_scale_values
         if hasattr(self.gaussian_model, 'get_scales'):
             scales = self.gaussian_model.get_scales()
         else:
@@ -205,13 +203,11 @@ class GaussianTrainer:
             
         rotations = self.gaussian_model.rotations
         
-        # 尝试使用 get_densities / density 属性
         if hasattr(self.gaussian_model, 'get_densities'):
             density = self.gaussian_model.get_densities()
         else:
             density = self.gaussian_model.density
         
-        # 渲染Gaussians到体素
         volume = self.voxelizer(
             positions=positions,
             scales=scales,
@@ -219,7 +215,6 @@ class GaussianTrainer:
             density=density
         )
         
-        # FFT到k-space
         kspace = fft3c(volume)
         
         return volume, kspace
@@ -229,7 +224,6 @@ class GaussianTrainer:
         if self.gaussian_model.positions.grad is None:
             return {}
         
-        # 位置梯度的范数
         grad_norm = torch.norm(
             self.gaussian_model.positions.grad, dim=-1
         )
@@ -242,7 +236,7 @@ class GaussianTrainer:
     
     def adaptive_density_control(self, iteration: int) -> Dict[str, int]:
         """
-        自适应密度控制 (修复了键名不匹配问题)
+        自适应密度控制 (Paper Section IV)
         """
         adaptive_config = self.config['adaptive_control']
         if not adaptive_config.get('enable', True):
@@ -250,26 +244,28 @@ class GaussianTrainer:
 
         stats = {'split': 0, 'clone': 0, 'prune': 0}
         
-        # 1. 修复: 键名匹配 default.yaml
         start_iter = adaptive_config.get('densify_from_iter', 100)
-        end_iter = adaptive_config.get('densify_until_iter', 1000)
-        interval = adaptive_config.get('densify_every', 100) # 现在会正确读取50
+        end_iter = adaptive_config.get('densify_until_iter', 1800) # Updated default
+        interval = adaptive_config.get('densify_every', 100) # Updated default to 100
         
+        # 论文 Page 4: "stop further densification" if max number reached
+        max_num_points = self.config['gaussian'].get('max_num_points', 400000)
+        if self.gaussian_model.num_points >= max_num_points:
+            return stats
+
         if iteration < start_iter or iteration > end_iter:
             return stats
         
         if iteration % interval != 0:
             return stats
         
-        # 获取梯度统计
         grad_stats = self.compute_gradient_stats()
         if not grad_stats:
             return stats
         
         grad_norm = grad_stats['grad_norm']
-        grad_threshold = adaptive_config.get('grad_threshold', 0.0002)
+        grad_threshold = adaptive_config.get('grad_threshold', 0.02) # Updated default
         
-        # 获取当前尺度 (兼容)
         if hasattr(self.gaussian_model, 'get_scale_values'):
             scales = self.gaussian_model.get_scale_values()
         else:
@@ -277,30 +273,29 @@ class GaussianTrainer:
             
         max_scale = scales.max(dim=-1)[0]
         
-        # 尺度阈值
         scale_threshold = adaptive_config.get('scale_threshold', 0.01)
-        max_scale_limit = adaptive_config.get('max_scale', 0.5) # 防止过大
+        max_scale_limit = adaptive_config.get('max_scale', 0.5)
         
-        # 高梯度点mask
         high_grad_mask = grad_norm > grad_threshold
         
-        # 2. 修复: 键名匹配 (long_axis_splitting -> use_long_axis_splitting)
+        # Split (Long-axis)
         if adaptive_config.get('use_long_axis_splitting', True):
             if high_grad_mask.shape[0] == self.gaussian_model.num_points:
                 split_mask = high_grad_mask & (max_scale > scale_threshold)
                 if split_mask.sum() > 0:
-                    self.gaussian_model.densify_and_split(
-                        grads=grad_norm, # 传递梯度
-                        grad_threshold=grad_threshold,
-                        scale_threshold=scale_threshold,
-                        use_long_axis_splitting=True
-                    )
-                    stats['split'] = split_mask.sum().item()
-                    high_grad_mask = None # 避免重复操作
+                    # 检查分裂后是否会超过最大点数
+                    if self.gaussian_model.num_points + split_mask.sum() <= max_num_points:
+                        self.gaussian_model.densify_and_split(
+                            grads=grad_norm,
+                            grad_threshold=grad_threshold,
+                            scale_threshold=scale_threshold,
+                            use_long_axis_splitting=True
+                        )
+                        stats['split'] = split_mask.sum().item()
+                        high_grad_mask = None # Consume mask
         
-        # 3. 修复: 键名匹配 (enable_cloning -> use_cloning)
+        # Clone (Only if enabled, usually False for high acceleration)
         if adaptive_config.get('use_cloning', False) and high_grad_mask is not None:
-             # 重新获取可能变化的参数
             if hasattr(self.gaussian_model, 'get_scale_values'):
                 scales = self.gaussian_model.get_scale_values()
             else:
@@ -310,13 +305,13 @@ class GaussianTrainer:
             if high_grad_mask.shape[0] == self.gaussian_model.num_points:
                 clone_mask = high_grad_mask & (max_scale <= scale_threshold)
                 if clone_mask.sum() > 0:
-                    self.gaussian_model.densify_and_clone(grad_norm, grad_threshold, scale_threshold)
-                    stats['clone'] = clone_mask.sum().item()
+                     if self.gaussian_model.num_points + clone_mask.sum() <= max_num_points:
+                        self.gaussian_model.densify_and_clone(grad_norm, grad_threshold, scale_threshold)
+                        stats['clone'] = clone_mask.sum().item()
         
-        # 4. 修复: 键名匹配 (prune_threshold -> opacity_threshold)
+        # Prune
         opacity_threshold = adaptive_config.get('opacity_threshold', 0.01)
         
-        # 重新获取参数
         if hasattr(self.gaussian_model, 'get_densities'):
             densities = torch.abs(self.gaussian_model.get_densities())
         else:
@@ -330,14 +325,12 @@ class GaussianTrainer:
         
         prune_mask = (densities < opacity_threshold) | (max_scale > max_scale_limit)
         
-        # 保持最小数量
         min_points = 100
         if (self.gaussian_model.num_points - prune_mask.sum()) >= min_points:
             if prune_mask.sum() > 0:
-                self.gaussian_model.prune(opacity_threshold) # 使用新的prune接口
+                self.gaussian_model.prune(opacity_threshold)
                 stats['prune'] = prune_mask.sum().item()
         
-        # 重建优化器 (如果参数数量变了)
         if stats['split'] > 0 or stats['clone'] > 0 or stats['prune'] > 0:
             train_config = self.config['training']
             gaussian_config = self.config['gaussian']
@@ -356,10 +349,8 @@ class GaussianTrainer:
         self.gaussian_model.train()
         self.optimizer.zero_grad()
         
-        # 前向传播
         volume, kspace_pred = self.forward()
         
-        # 计算loss
         loss_dict = self.criterion(
             kspace_pred=kspace_pred,
             kspace_target=self.kspace_undersampled,
@@ -368,10 +359,8 @@ class GaussianTrainer:
             image_target=self.target_image
         )
         
-        # 反向传播
         loss_dict['total_loss'].backward()
         
-        # 梯度裁剪
         max_grad_norm = self.config['training'].get('max_grad_norm', 1.0)
         if max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -379,7 +368,6 @@ class GaussianTrainer:
                 max_grad_norm
             )
         
-        # 更新参数
         self.optimizer.step()
         
         return {k: v.item() for k, v in loss_dict.items()}
@@ -413,7 +401,7 @@ class GaussianTrainer:
             best_path = os.path.join(self.checkpoint_dir, 'best.pth')
             torch.save(checkpoint, best_path)
         
-        save_every = self.config['training'].get('save_every', 500) # Fixed key
+        save_every = self.config['training'].get('save_every', 500)
         if iteration % save_every == 0:
             iter_path = os.path.join(self.checkpoint_dir, f'checkpoint_{iteration:06d}.pth')
             torch.save(checkpoint, iter_path)
@@ -444,8 +432,8 @@ class GaussianTrainer:
         """完整训练流程"""
         train_config = self.config['training']
         max_iterations = train_config['max_iterations']
-        eval_every = train_config.get('eval_every', 100) # Fixed key
-        log_every = train_config.get('log_every', 10) # Fixed key
+        eval_every = train_config.get('eval_every', 100)
+        log_every = train_config.get('log_every', 50)
         
         if resume_from is not None:
             self.load_checkpoint(resume_from)

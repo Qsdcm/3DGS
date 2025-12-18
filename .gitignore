@@ -25,3 +25,16 @@ gsmr3d/__pycache__/metrics.cpython-310.pyc
 3dgsVC/outputs/results/reconstruction_final.npy
 3dgsVC/outputs/checkpoints/checkpoint_000000.pth
 3dgsVC/outputs/checkpoints/latest.pth
+3dgsVC/outputs/acc4_pts500_seed42/config.yaml
+3dgsVC/outputs/acc4_pts500_seed42/checkpoints/best.pth
+3dgsVC/outputs/acc4_pts500_seed42/checkpoints/checkpoint_000000.pth
+3dgsVC/outputs/acc4_pts500_seed42/checkpoints/checkpoint_000500.pth
+3dgsVC/outputs/acc4_pts500_seed42/checkpoints/latest.pth
+3dgsVC/outputs/checkpoints/best.pth
+3dgsVC/outputs/checkpoints/checkpoint_001000.pth
+3dgsVC/outputs/checkpoints/checkpoint_001500.pth
+3dgsVC/outputs/checkpoints/best.pth
+3dgsVC/outputs/checkpoints/best.pth
+3dgsVC/outputs/checkpoints/best.pth
+3dgsVC/outputs/checkpoints/best.pth
+3dgsVC/outputs/checkpoints/best.pth
