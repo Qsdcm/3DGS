@@ -19,12 +19,6 @@ def quaternion_to_rotation_matrix(quaternion: torch.Tensor) -> torch.Tensor:
     
     return torch.stack([row0, row1, row2], dim=-2)
 
-def build_covariance_matrix(scale: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
-    R = quaternion_to_rotation_matrix(rotation)
-    S = torch.diag_embed(torch.exp(scale))
-    L = R @ S
-    return L @ L.transpose(-1, -2)
-
 class GaussianModel3D(nn.Module):
     def __init__(
         self,
@@ -32,7 +26,7 @@ class GaussianModel3D(nn.Module):
         volume_shape: Tuple[int, int, int],
         initial_positions: Optional[torch.Tensor] = None,
         initial_densities: Optional[torch.Tensor] = None,
-        initial_scales: Optional[torch.Tensor] = None, # Changed from initial_scale float
+        initial_scales: Optional[torch.Tensor] = None,
         device: str = "cuda:0"
     ):
         super().__init__()
@@ -80,6 +74,16 @@ class GaussianModel3D(nn.Module):
     
     def get_scale_values(self) -> torch.Tensor:
         return torch.exp(self.scales)
+
+    # --- 修复部分：添加 trainer.py 需要的兼容方法 ---
+    def get_scales(self) -> torch.Tensor:
+        """兼容 trainer.py 的调用"""
+        return self.get_scale_values()
+
+    def get_densities(self) -> torch.Tensor:
+        """兼容 trainer.py 的调用"""
+        return self.density
+    # -------------------------------------------
     
     def get_gaussian_params(self) -> Dict[str, torch.Tensor]:
         return {
@@ -129,36 +133,26 @@ class GaussianModel3D(nn.Module):
                 # 1. 找到最长轴
                 longest_axis = p_scale.argmax(dim=-1) # (K,)
                 
-                # 2. 计算偏移
-                # 论文要求无重叠。假设3sigma原则，偏移量需要大于1.5 * sigma
-                # 这里沿最长轴偏移。
-                # p_scale 是 sigma.
+                # 2. 计算偏移 (无重叠)
                 offset_val = p_scale[torch.arange(K), longest_axis] # (K,)
-                # 偏移量设为 1.0 * sigma (或者论文隐含的更远，这里取1.0保证分开)
-                shift = torch.zeros_like(p_pos)
-                shift[torch.arange(K), longest_axis] = offset_val * 1.0 
                 
-                # 应用旋转到偏移量 (因为scale是在局部坐标系，pos是全局)
-                # 这一步非常重要！Scale是在旋转后的坐标系定义的。
-                # 偏移应该沿着局部坐标系的轴方向，然后旋转到全局。
-                R = quaternion_to_rotation_matrix(p_rot) # (K, 3, 3)
-                # 局部偏移向量 (只有一个轴有值)
+                # 局部偏移向量
                 local_shift = torch.zeros_like(p_pos)
-                local_shift[torch.arange(K), longest_axis] = offset_val * 1.0 # (K, 3)
-                # 旋转到全局
+                local_shift[torch.arange(K), longest_axis] = offset_val * 1.0 # 1.0 sigma 偏移
+                
+                # 旋转到全局坐标系
+                R = quaternion_to_rotation_matrix(p_rot) # (K, 3, 3)
                 global_shift = torch.bmm(R, local_shift.unsqueeze(-1)).squeeze(-1) # (K, 3)
                 
                 new_pos_1 = p_pos + global_shift
                 new_pos_2 = p_pos - global_shift
                 
                 # 3. 调整尺度
-                # 论文: splits along longest axis... other two axes scaled by 0.85
-                # Long axis: 既然分裂了，长度应该减小，比如 * 0.6
                 new_scale = p_scale.clone()
-                # 这里的索引操作需要小心
+                # 长轴变短 (* 0.6)
                 new_scale[torch.arange(K), longest_axis] *= 0.6
                 
-                # 其他轴 * 0.85
+                # 其他轴变窄 (* 0.85)
                 mask_other = torch.ones_like(new_scale, dtype=torch.bool)
                 mask_other[torch.arange(K), longest_axis] = False
                 new_scale[mask_other] *= 0.85
@@ -166,15 +160,12 @@ class GaussianModel3D(nn.Module):
                 new_positions = torch.cat([new_pos_1, new_pos_2], dim=0)
                 new_scales = torch.cat([new_scale, new_scale], dim=0)
                 new_rotations = torch.cat([p_rot, p_rot], dim=0)
-                # 能量守恒/2
+                # 能量守恒
                 new_den_r = torch.cat([p_den_r/2, p_den_r/2], dim=0)
                 new_den_i = torch.cat([p_den_i/2, p_den_i/2], dim=0)
                 
             else:
-                # 原始逻辑 ...
-                pass # 略，为了简洁，你保留原始代码即可
-                
-                # 这里是一个简单的fallback占位
+                # 原始逻辑 Fallback
                 std = p_scale
                 offset = torch.randn_like(p_pos) * std * 0.5
                 new_positions = torch.cat([p_pos - offset, p_pos + offset], dim=0)
@@ -188,19 +179,7 @@ class GaussianModel3D(nn.Module):
             self._update_params(keep_mask, new_positions, new_scales, new_rotations, new_den_r, new_den_i)
             return K
 
-    def _update_params(self, keep_mask, new_pos, new_scale, new_rot, new_dr, new_di):
-        # 辅助函数：更新参数
-        self.positions = nn.Parameter(torch.cat([self.positions[keep_mask], new_pos], dim=0))
-        self.scales = nn.Parameter(torch.cat([self.scales[keep_mask], torch.log(new_scale + 1e-8)], dim=0))
-        self.rotations = nn.Parameter(torch.cat([self.rotations[keep_mask], new_rot], dim=0))
-        self.density_real = nn.Parameter(torch.cat([self.density_real[keep_mask], new_dr], dim=0))
-        self.density_imag = nn.Parameter(torch.cat([self.density_imag[keep_mask], new_di], dim=0))
-        self.num_points = self.positions.shape[0]
-
-    # 添加缺失的 densify_and_clone 和 prune 方法 (保持你原来的代码逻辑，或者稍作优化)
-    # ... (此处省略，以保持回答简洁，请将原文件中的 densify_and_clone 和 prune 复制回来)
     def densify_and_clone(self, grads, grad_threshold, scale_threshold):
-        # 请使用你原文件中的逻辑，确保更新时使用 nn.Parameter 重新包装
         with torch.no_grad():
              scales = self.get_scale_values()
              max_scales = scales.max(dim=-1)[0]
@@ -208,12 +187,14 @@ class GaussianModel3D(nn.Module):
              if mask.sum() == 0: return 0
              
              new_pos = self.positions[mask]
-             new_scale = scales[mask] # Clone values, not log
+             new_scale = scales[mask]
              new_rot = self.rotations[mask]
              new_dr = self.density_real[mask]
              new_di = self.density_imag[mask]
              
+             # Clone操作
              self.positions = nn.Parameter(torch.cat([self.positions, new_pos], dim=0))
+             # 注意：new_scale 已经是 exp 后的值，需要重新 log
              self.scales = nn.Parameter(torch.cat([self.scales, torch.log(new_scale+1e-8)], dim=0))
              self.rotations = nn.Parameter(torch.cat([self.rotations, new_rot], dim=0))
              self.density_real = nn.Parameter(torch.cat([self.density_real, new_dr], dim=0))
@@ -227,73 +208,67 @@ class GaussianModel3D(nn.Module):
             mask = density_mag > opacity_threshold
             if mask.sum() == self.num_points: return 0
             
+            self._update_params(mask, None, None, None, None, None, is_prune=True)
+            return (len(mask) - mask.sum().item())
+
+    def _update_params(self, mask, new_pos=None, new_scale=None, new_rot=None, new_dr=None, new_di=None, is_prune=False):
+        # 统一参数更新辅助函数
+        if is_prune:
             self.positions = nn.Parameter(self.positions[mask])
             self.scales = nn.Parameter(self.scales[mask])
             self.rotations = nn.Parameter(self.rotations[mask])
             self.density_real = nn.Parameter(self.density_real[mask])
             self.density_imag = nn.Parameter(self.density_imag[mask])
-            self.num_points = self.positions.shape[0]
-            return (len(mask) - mask.sum().item())
+        else:
+            self.positions = nn.Parameter(torch.cat([self.positions[mask], new_pos], dim=0))
+            self.scales = nn.Parameter(torch.cat([self.scales[mask], torch.log(new_scale + 1e-8)], dim=0))
+            self.rotations = nn.Parameter(torch.cat([self.rotations[mask], new_rot], dim=0))
+            self.density_real = nn.Parameter(torch.cat([self.density_real[mask], new_dr], dim=0))
+            self.density_imag = nn.Parameter(torch.cat([self.density_imag[mask], new_di], dim=0))
+            
+        self.num_points = self.positions.shape[0]
 
     @classmethod
     def from_image(cls, image: torch.Tensor, num_points: int, initial_scale: float = 2.0, device: str = "cuda:0"):
-        """
-        符合论文的初始化：
-        1. 移除低强度点
-        2. 随机采样 M 个网格点
-        3. 初始尺度 = 最近3个点的平均距离
-        4. 密度缩放
-        """
+        """符合论文的初始化"""
         D, H, W = image.shape
-        # 1. 阈值过滤 (移除背景/噪声)
+        # 1. 阈值过滤
         mag = torch.abs(image).flatten()
-        # 假设保留前 10% 或 20% 强度的点，或者使用绝对阈值
-        threshold = torch.quantile(mag, 0.90) # 只保留前10%亮的点作为候选
+        threshold = torch.quantile(mag, 0.90)
         candidates = torch.nonzero(mag > threshold).squeeze()
         
         if candidates.numel() < num_points:
-            # 如果候选点不够，降低标准
             candidates = torch.arange(mag.numel(), device=device)
         
-        # 2. 随机采样 (Uniform sampling from candidates)
+        # 2. 随机采样
         indices_idx = torch.randperm(candidates.numel(), device=device)[:num_points]
         indices = candidates[indices_idx]
         
-        # 转换为坐标 [-1, 1]
+        # 坐标转换
         z = indices // (H * W)
         rem = indices % (H * W)
         y = rem // W
         x = rem % W
         
-        # 归一化坐标
         positions = torch.stack([
             z.float() / D * 2 - 1,
             y.float() / H * 2 - 1,
             x.float() / W * 2 - 1
         ], dim=-1)
         
-        # 3. 初始尺度: KNN=3 平均距离
-        # 由于点都在网格上，可以直接估算或者真实计算。真实计算更准。
-        # 为了速度，只计算这M个点之间的距离
-        # 注意：Scale需要对应归一化坐标系下的距离，还是体素距离？
-        # 模型中的 scale 通常对应 world/normalized space。
-        # 计算归一化坐标下的距离
+        # 3. 初始尺度 (KNN=3)
         if num_points > 3:
-            # 使用 torch.cdist 计算距离矩阵 (N, N) - 注意显存，500-2000个点没问题
-            # 如果点很多(>10k)，需要分块或使用 cKDTree (CPU)
             dist_mat = torch.cdist(positions, positions)
             dist_mat.fill_diagonal_(float('inf'))
-            vals, _ = dist_mat.topk(3, largest=False, dim=1) # (N, 3)
-            mean_dist = vals.mean(dim=1, keepdim=True) # (N, 1)
-            scales_init = mean_dist.repeat(1, 3) # 各向同性初始化
+            vals, _ = dist_mat.topk(3, largest=False, dim=1)
+            mean_dist = vals.mean(dim=1, keepdim=True)
+            scales_init = mean_dist.repeat(1, 3)
         else:
             scales_init = torch.ones(num_points, 3, device=device) * (2.0/D)
             
-        # 4. 密度初始化
-        # 论文: "scaling down with factor k" (e.g., 0.15)
-        # 获取对应位置的复数值
+        # 4. 密度初始化 (scale down)
         img_flat = image.reshape(-1)
-        densities = img_flat[indices] * 0.15 # k=0.15 from paper ablation
+        densities = img_flat[indices] * 0.15
         
         return cls(
             num_points=num_points,

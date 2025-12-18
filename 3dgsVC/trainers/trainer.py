@@ -1,5 +1,5 @@
 """
-3DGSMR Trainer
+3DGSMR Trainer (Fixed Config Keys)
 
 完整的训练流程:
 1. 初始化3D Gaussians (从零填充重建或随机)
@@ -112,7 +112,7 @@ class GaussianTrainer:
             self.gaussian_model = GaussianModel3D.from_image(
                 image=self.zero_filled,
                 num_points=gaussian_config['initial_num_points'],
-                initial_scale=gaussian_config.get('init_scale', 2.0),
+                initial_scale=gaussian_config.get('initial_scale', 2.0), # Fixed key: init_scale -> initial_scale
                 device=str(self.device)
             )
         else:  # random
@@ -120,7 +120,7 @@ class GaussianTrainer:
             self.gaussian_model = GaussianModel3D(
                 num_points=gaussian_config['initial_num_points'],
                 volume_shape=tuple(self.volume_shape),
-                initial_scale=gaussian_config.get('init_scale', 2.0),
+                initial_scale=gaussian_config.get('initial_scale', 2.0), # Fixed key
                 device=str(self.device)
             )
         
@@ -146,23 +146,26 @@ class GaussianTrainer:
     def _setup_optimizer(self):
         """初始化优化器"""
         train_config = self.config['training']
+        gaussian_config = self.config['gaussian']
         
         # 获取可优化参数
         params = self.gaussian_model.get_optimizable_params(
-            lr_position=train_config.get('lr_position', 1e-4),
-            lr_density=train_config.get('lr_density', 1e-3),
-            lr_scale=train_config.get('lr_scale', 5e-4),
-            lr_rotation=train_config.get('lr_rotation', 1e-4)
+            lr_position=gaussian_config.get('position_lr', 1e-4), # Fixed: Use gaussian config keys
+            lr_density=gaussian_config.get('density_lr', 1e-3),
+            lr_scale=gaussian_config.get('scale_lr', 5e-4),
+            lr_rotation=gaussian_config.get('rotation_lr', 1e-4)
         )
         
         self.optimizer = optim.Adam(params)
         
         # 学习率调度器
-        scheduler_type = train_config.get('scheduler', 'exponential')
+        scheduler_config = train_config.get('lr_scheduler', {})
+        scheduler_type = scheduler_config.get('type', 'exponential')
+        
         if scheduler_type == 'exponential':
             self.scheduler = ExponentialLR(
                 self.optimizer,
-                gamma=train_config.get('lr_decay', 0.999)
+                gamma=scheduler_config.get('gamma', 0.999)
             )
         else:
             self.scheduler = CosineAnnealingLR(
@@ -190,17 +193,23 @@ class GaussianTrainer:
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播: Gaussians -> Volume -> K-space
-        
-        论文公式(3): x_j = sum_i G_i^3(j|ρ_i, p_i, Σ_i)
-        
-        Returns:
-            (reconstructed_volume, predicted_kspace)
         """
-        # 获取Gaussian参数
+        # 获取Gaussian参数 (兼容新旧接口)
         positions = self.gaussian_model.positions
-        scales = self.gaussian_model.get_scales()
+        
+        # 尝试使用 get_scales / get_scale_values
+        if hasattr(self.gaussian_model, 'get_scales'):
+            scales = self.gaussian_model.get_scales()
+        else:
+            scales = self.gaussian_model.get_scale_values()
+            
         rotations = self.gaussian_model.rotations
-        density = self.gaussian_model.get_densities()
+        
+        # 尝试使用 get_densities / density 属性
+        if hasattr(self.gaussian_model, 'get_densities'):
+            density = self.gaussian_model.get_densities()
+        else:
+            density = self.gaussian_model.density
         
         # 渲染Gaussians到体素
         volume = self.voxelizer(
@@ -233,23 +242,18 @@ class GaussianTrainer:
     
     def adaptive_density_control(self, iteration: int) -> Dict[str, int]:
         """
-        自适应密度控制
-        
-        论文Section IV的核心策略:
-        - Split: 将高梯度、大尺度的Gaussian沿长轴分裂
-        - Clone: 复制高梯度、小尺度的Gaussian
-        - Prune: 移除低密度或过大的Gaussian
-        
-        Returns:
-            操作统计信息
+        自适应密度控制 (修复了键名不匹配问题)
         """
         adaptive_config = self.config['adaptive_control']
+        if not adaptive_config.get('enable', True):
+            return {'split': 0, 'clone': 0, 'prune': 0}
+
         stats = {'split': 0, 'clone': 0, 'prune': 0}
         
-        # 检查是否在控制区间内
-        start_iter = adaptive_config.get('densify_start', 100)
-        end_iter = adaptive_config.get('densify_end', 1500)
-        interval = adaptive_config.get('densify_interval', 100)
+        # 1. 修复: 键名匹配 default.yaml
+        start_iter = adaptive_config.get('densify_from_iter', 100)
+        end_iter = adaptive_config.get('densify_until_iter', 1000)
+        interval = adaptive_config.get('densify_every', 100) # 现在会正确读取50
         
         if iteration < start_iter or iteration > end_iter:
             return stats
@@ -265,123 +269,90 @@ class GaussianTrainer:
         grad_norm = grad_stats['grad_norm']
         grad_threshold = adaptive_config.get('grad_threshold', 0.0002)
         
-        # 获取当前尺度
-        scales = self.gaussian_model.get_scale_values()  # 使用get_scale_values获取真实尺度
+        # 获取当前尺度 (兼容)
+        if hasattr(self.gaussian_model, 'get_scale_values'):
+            scales = self.gaussian_model.get_scale_values()
+        else:
+            scales = self.gaussian_model.get_scales()
+            
         max_scale = scales.max(dim=-1)[0]
         
         # 尺度阈值
         scale_threshold = adaptive_config.get('scale_threshold', 0.01)
-        max_scale_limit = adaptive_config.get('max_scale', 0.1)
+        max_scale_limit = adaptive_config.get('max_scale', 0.5) # 防止过大
         
         # 高梯度点mask
         high_grad_mask = grad_norm > grad_threshold
         
-        # Split: 高梯度且尺度大的Gaussian
-        # 论文特别强调沿长轴分裂对高加速因子有效
-        if adaptive_config.get('long_axis_splitting', True):
-            # 重新计算mask，因为点数可能变了
-            # 注意：这里简化处理，如果刚发生了split，梯度信息可能不再对应
-            # 理想情况下应该重新计算梯度，或者只执行一种操作
-            # 这里我们优先执行split，如果执行了split，就不执行clone
-            
-            # 重新获取当前状态
-            scales = self.gaussian_model.get_scale_values()
-            max_scale = scales.max(dim=-1)[0]
-            
-            # 确保mask长度匹配
-            if high_grad_mask.shape[0] != self.gaussian_model.num_points:
-                # 如果点数变了（虽然这里不应该变），则跳过
-                pass
-            else:
+        # 2. 修复: 键名匹配 (long_axis_splitting -> use_long_axis_splitting)
+        if adaptive_config.get('use_long_axis_splitting', True):
+            if high_grad_mask.shape[0] == self.gaussian_model.num_points:
                 split_mask = high_grad_mask & (max_scale > scale_threshold)
                 if split_mask.sum() > 0:
-                    self.gaussian_model.densify_and_split(split_mask)
+                    self.gaussian_model.densify_and_split(
+                        grads=grad_norm, # 传递梯度
+                        grad_threshold=grad_threshold,
+                        scale_threshold=scale_threshold,
+                        use_long_axis_splitting=True
+                    )
                     stats['split'] = split_mask.sum().item()
-                    
-                    # 如果发生了split，点数增加了，原来的mask失效了
-                    # 为了简单起见，本次迭代不再执行clone
-                    high_grad_mask = None 
+                    high_grad_mask = None # 避免重复操作
         
-        # Clone: 高梯度且尺度小的Gaussian
-        if adaptive_config.get('enable_cloning', True) and high_grad_mask is not None:
-            # 重新获取当前状态
-            scales = self.gaussian_model.get_scale_values()
+        # 3. 修复: 键名匹配 (enable_cloning -> use_cloning)
+        if adaptive_config.get('use_cloning', False) and high_grad_mask is not None:
+             # 重新获取可能变化的参数
+            if hasattr(self.gaussian_model, 'get_scale_values'):
+                scales = self.gaussian_model.get_scale_values()
+            else:
+                scales = self.gaussian_model.get_scales()
             max_scale = scales.max(dim=-1)[0]
             
             if high_grad_mask.shape[0] == self.gaussian_model.num_points:
                 clone_mask = high_grad_mask & (max_scale <= scale_threshold)
                 if clone_mask.sum() > 0:
-                    self.gaussian_model.densify_and_clone(clone_mask)
+                    self.gaussian_model.densify_and_clone(grad_norm, grad_threshold, scale_threshold)
                     stats['clone'] = clone_mask.sum().item()
         
-        # Prune: 移除低密度或过大的Gaussian
-        prune_threshold = adaptive_config.get('prune_threshold', 0.005)
-        densities = torch.abs(self.gaussian_model.get_densities())
+        # 4. 修复: 键名匹配 (prune_threshold -> opacity_threshold)
+        opacity_threshold = adaptive_config.get('opacity_threshold', 0.01)
         
-        # 重新获取scales，因为可能发生了变化
-        scales = self.gaussian_model.get_scale_values()
+        # 重新获取参数
+        if hasattr(self.gaussian_model, 'get_densities'):
+            densities = torch.abs(self.gaussian_model.get_densities())
+        else:
+            densities = torch.abs(self.gaussian_model.density)
+            
+        if hasattr(self.gaussian_model, 'get_scale_values'):
+            scales = self.gaussian_model.get_scale_values()
+        else:
+            scales = self.gaussian_model.get_scales()
         max_scale = scales.max(dim=-1)[0]
         
-        prune_mask = (densities < prune_threshold) | (max_scale > max_scale_limit)
+        prune_mask = (densities < opacity_threshold) | (max_scale > max_scale_limit)
         
-        # 保持最小数量的Gaussians
-        min_points = adaptive_config.get('min_num_points', 100)
+        # 保持最小数量
+        min_points = 100
         if (self.gaussian_model.num_points - prune_mask.sum()) >= min_points:
             if prune_mask.sum() > 0:
-                self.gaussian_model.prune(prune_mask)
+                self.gaussian_model.prune(opacity_threshold) # 使用新的prune接口
                 stats['prune'] = prune_mask.sum().item()
         
-        # 重建优化器
+        # 重建优化器 (如果参数数量变了)
         if stats['split'] > 0 or stats['clone'] > 0 or stats['prune'] > 0:
-            # 关键修复：当参数形状改变时，必须清除优化器状态
-            # 并且不能在backward之后立即改变参数形状，因为梯度还在计算图中
-            # 但这里是在backward之后调用的（在train loop中），所以是安全的
-            # 问题在于：如果我们在backward之前改变了参数（比如在adaptive_density_control中），
-            # 那么backward时就会报错，因为计算图中的参数形状和实际参数形状不匹配
-            
-            # 实际上，adaptive_density_control是在train loop的末尾调用的
-            # 所以参数改变发生在backward之后，这是正确的
-            
-            # 但是，如果我们在adaptive_density_control中改变了参数，
-            # 那么在下一次forward之前，我们需要重新初始化优化器
-            
-            # 这里的潜在问题是：Adam优化器内部维护了动量等状态，这些状态的形状必须与参数匹配
-            # 当我们改变参数形状时，必须重新初始化优化器
-            
             train_config = self.config['training']
-            
-            # 获取当前学习率（可能已经衰减）
-            current_lr_dict = {}
-            for param_group in self.optimizer.param_groups:
-                # 假设参数组顺序固定
-                pass
-            
-            # 简单起见，使用初始学习率或当前衰减后的学习率
-            # 这里我们重新创建一个新的优化器
-            
+            gaussian_config = self.config['gaussian']
             params = self.gaussian_model.get_optimizable_params(
-                lr_position=train_config.get('gaussian', {}).get('position_lr', 0.001),
-                lr_density=train_config.get('gaussian', {}).get('density_lr', 0.01),
-                lr_scale=train_config.get('gaussian', {}).get('scale_lr', 0.005),
-                lr_rotation=train_config.get('gaussian', {}).get('rotation_lr', 0.001)
+                lr_position=gaussian_config.get('position_lr', 1e-4),
+                lr_density=gaussian_config.get('density_lr', 1e-3),
+                lr_scale=gaussian_config.get('scale_lr', 5e-4),
+                lr_rotation=gaussian_config.get('rotation_lr', 1e-4)
             )
             self.optimizer = optim.Adam(params)
-            
-            # 还需要更新scheduler
-            self._setup_optimizer() # 重新设置optimizer和scheduler
-            
-            # 打印信息
-            print(f"  Re-initialized optimizer with {self.gaussian_model.num_points} points")
         
         return stats
     
     def train_step(self) -> Dict[str, float]:
-        """
-        单步训练
-        
-        Returns:
-            包含loss值的字典
-        """
+        """单步训练"""
         self.gaussian_model.train()
         self.optimizer.zero_grad()
         
@@ -391,7 +362,7 @@ class GaussianTrainer:
         # 计算loss
         loss_dict = self.criterion(
             kspace_pred=kspace_pred,
-            kspace_target=self.kspace_undersampled,  # 使用欠采样k-space作为目标
+            kspace_target=self.kspace_undersampled,
             mask=self.mask,
             image_pred=volume,
             image_target=self.target_image
@@ -414,24 +385,15 @@ class GaussianTrainer:
         return {k: v.item() for k, v in loss_dict.items()}
     
     def evaluate(self) -> Dict[str, float]:
-        """
-        评估当前重建质量
-        
-        Returns:
-            评估指标字典
-        """
+        """评估"""
         self.gaussian_model.eval()
-        
         with torch.no_grad():
             volume, kspace_pred = self.forward()
-            
-            # 计算评估指标
             metrics = evaluate_reconstruction(
                 pred=volume,
                 target=self.target_image,
                 compute_3d_ssim=True
             )
-        
         return metrics
     
     def save_checkpoint(self, iteration: int, is_best: bool = False):
@@ -445,145 +407,87 @@ class GaussianTrainer:
             'best_ssim': self.best_ssim,
             'config': self.config
         }
-        
-        # 保存最新checkpoint
         latest_path = os.path.join(self.checkpoint_dir, 'latest.pth')
         torch.save(checkpoint, latest_path)
-        
-        # 保存best checkpoint
         if is_best:
             best_path = os.path.join(self.checkpoint_dir, 'best.pth')
             torch.save(checkpoint, best_path)
         
-        # 定期保存
-        save_interval = self.config['output'].get('save_interval', 500)
-        if iteration % save_interval == 0:
-            iter_path = os.path.join(
-                self.checkpoint_dir,
-                f'checkpoint_{iteration:06d}.pth'
-            )
+        save_every = self.config['training'].get('save_every', 500) # Fixed key
+        if iteration % save_every == 0:
+            iter_path = os.path.join(self.checkpoint_dir, f'checkpoint_{iteration:06d}.pth')
             torch.save(checkpoint, iter_path)
     
     def load_checkpoint(self, checkpoint_path: str):
         """加载checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
         self.gaussian_model.load_state_dict(checkpoint['gaussian_state'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state'])
-        
         self.current_iteration = checkpoint['iteration']
         self.best_psnr = checkpoint.get('best_psnr', 0.0)
         self.best_ssim = checkpoint.get('best_ssim', 0.0)
-        
         print(f"Loaded checkpoint from iteration {self.current_iteration}")
     
     def save_reconstruction(self, iteration: int):
         """保存重建结果"""
         self.gaussian_model.eval()
-        
         with torch.no_grad():
             volume, kspace_pred = self.forward()
-            
-            # 转换为numpy
             volume_np = volume.detach().cpu().numpy()
-            
-            # 保存为.npy
-            result_path = os.path.join(
-                self.result_dir,
-                f'reconstruction_{iteration:06d}.npy'
-            )
+            result_path = os.path.join(self.result_dir, f'reconstruction_{iteration:06d}.npy')
             np.save(result_path, volume_np)
-            
-            # 保存最终结果
             final_path = os.path.join(self.result_dir, 'reconstruction_final.npy')
             np.save(final_path, volume_np)
     
     def train(self, resume_from: Optional[str] = None):
-        """
-        完整训练流程
-        
-        Args:
-            resume_from: 恢复训练的checkpoint路径
-        """
+        """完整训练流程"""
         train_config = self.config['training']
         max_iterations = train_config['max_iterations']
-        eval_interval = train_config.get('eval_interval', 100)
-        log_interval = train_config.get('log_interval', 10)
+        eval_every = train_config.get('eval_every', 100) # Fixed key
+        log_every = train_config.get('log_every', 10) # Fixed key
         
-        # 恢复训练
         if resume_from is not None:
             self.load_checkpoint(resume_from)
         
         start_iter = self.current_iteration
-        
         print(f"\nStarting training from iteration {start_iter}")
         print(f"Total iterations: {max_iterations}")
         print("-" * 50)
         
-        # 训练循环
-        pbar = tqdm(
-            range(start_iter, max_iterations),
-            desc="Training",
-            dynamic_ncols=True
-        )
+        pbar = tqdm(range(start_iter, max_iterations), desc="Training", dynamic_ncols=True)
         
         for iteration in pbar:
             self.current_iteration = iteration
-            start_time = time.time()
             
-            # 训练步骤
-            # 注意：如果上一步进行了densification，optimizer已经被重新初始化
-            # 这里的train_step会使用新的optimizer
             loss_dict = self.train_step()
-            
-            # 自适应密度控制
-            # 这会改变模型参数形状，并重新初始化optimizer
-            # 必须在train_step之后调用，这样下一次迭代才会使用新的optimizer
             adaptive_stats = self.adaptive_density_control(iteration)
-            
-            # 学习率调度
             self.scheduler.step()
             
-            # 日志
-            if iteration % log_interval == 0:
+            if iteration % log_every == 0:
                 pbar.set_postfix({
                     'loss': f"{loss_dict['total_loss']:.4f}",
                     'kspace': f"{loss_dict['kspace_loss']:.4f}",
                     'n_pts': self.gaussian_model.num_points
                 })
             
-            # 评估
-            if iteration % eval_interval == 0 or iteration == max_iterations - 1:
+            if iteration % eval_every == 0 or iteration == max_iterations - 1:
                 metrics = self.evaluate()
-                
                 is_best = metrics['psnr'] > self.best_psnr
                 if is_best:
                     self.best_psnr = metrics['psnr']
                     self.best_ssim = metrics['ssim']
                 
-                print(f"\n[Iter {iteration}] "
-                      f"PSNR: {metrics['psnr']:.2f} dB, "
-                      f"SSIM: {metrics['ssim']:.4f}, "
-                      f"NMSE: {metrics['nmse']:.6f}")
-                
+                print(f"\n[Iter {iteration}] PSNR: {metrics['psnr']:.2f} dB, SSIM: {metrics['ssim']:.4f}")
                 if adaptive_stats['split'] > 0 or adaptive_stats['clone'] > 0:
-                    print(f"  Density control: split={adaptive_stats['split']}, "
-                          f"clone={adaptive_stats['clone']}, "
-                          f"prune={adaptive_stats['prune']}")
-                
+                    print(f"  Density control: split={adaptive_stats['split']}, clone={adaptive_stats['clone']}, prune={adaptive_stats['prune']}")
                 print(f"  Num Gaussians: {self.gaussian_model.num_points}")
                 
-                # 保存checkpoint
                 self.save_checkpoint(iteration, is_best)
         
-        # 训练结束
         print("\n" + "=" * 50)
         print("Training completed!")
         print(f"Best PSNR: {self.best_psnr:.2f} dB")
         print(f"Best SSIM: {self.best_ssim:.4f}")
-        
-        # 保存最终结果
         self.save_reconstruction(max_iterations)
-        
         return self.best_psnr, self.best_ssim
