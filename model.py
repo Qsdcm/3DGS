@@ -1,827 +1,789 @@
+"""model.py
+
+3D Gaussian Splatting for MRI Reconstruction 模型模块。
+
+核心组件：
+- GaussianMRIModel: 封装 Gaussian 参数、体素化、densify/prune、forward operator
+- Voxelizer: 将 Gaussians 体素化为 3D complex volume（baseline 纯 PyTorch 实现）
+- MRI Forward Operator: A(X) = mask ⊙ FFT3(X)
+
+每个 Gaussian i 参数：
+- center p_i ∈ R^3（[-1, 1] 归一化坐标）
+- log_scale s_i ∈ R^3（实际 scale = exp(log_scale)）
+- rotation q_i ∈ R^4（quaternion，baseline 固定为 identity）
+- rho_i ∈ C（complex density，用 rho_real + rho_imag 两个 float 参数化）
 """
-3DGSMR Model Module
-定义复数高斯模型 (Complex Gaussian Model) 和 Voxelizer
-实现长轴分裂 (Long-axis Splitting) 策略
-"""
+
+from __future__ import annotations
+
+import math
+from typing import Optional, Tuple, Dict, Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
-from typing import Tuple, Optional, Dict
-import math
 
-
-class ComplexGaussianModel(nn.Module):
-    """
-    复数 3D 高斯模型
-    
-    与传统 3DGS 不同，MRI 重建中高斯的 "密度/不透明度" 是复数值，
-    因为 MRI 图像本身是复数。
-    
-    参数:
-        - positions: (N, 3) 高斯中心位置
-        - scales: (N, 3) 各轴尺度 (控制高斯宽度)
-        - rotations: (N, 4) 四元数旋转
-        - densities_real: (N,) 复数密度的实部
-        - densities_imag: (N,) 复数密度的虚部
-    """
-    
-    def __init__(
-        self,
-        num_gaussians: int,
-        volume_shape: Tuple[int, int, int],
-        device: str = 'cuda',
-        init_scale: float = 0.05,
-        init_density: float = 0.01
-    ):
-        super().__init__()
-        
-        self.num_gaussians = num_gaussians
-        self.volume_shape = volume_shape
-        self.device = device
-        self.init_scale = init_scale
-        self.init_density = init_density
-        
-        # 初始化高斯参数
-        self._init_parameters(num_gaussians)
-        
-        # 缓存协方差矩阵的逆
-        self._cov_inv_cache = None
-        self._cache_valid = False
-    
-    def _init_parameters(self, num_gaussians: int):
-        """初始化高斯参数"""
-        # 位置: 在 [-1, 1] 范围内均匀分布
-        positions = (torch.rand(num_gaussians, 3, device=self.device) * 2 - 1)
-        self.positions = nn.Parameter(positions)
-        
-        # 尺度: 使用 log 空间避免负值，初始化为小值
-        log_scales = torch.ones(num_gaussians, 3, device=self.device) * math.log(self.init_scale)
-        self.log_scales = nn.Parameter(log_scales)
-        
-        # 旋转: 四元数 (w, x, y, z)，初始化为单位四元数
-        rotations = torch.zeros(num_gaussians, 4, device=self.device)
-        rotations[:, 0] = 1.0  # w = 1, 其余为 0
-        self.rotations = nn.Parameter(rotations)
-        
-        # 复数密度 (MRI 特有)
-        densities_real = torch.randn(num_gaussians, device=self.device) * self.init_density
-        densities_imag = torch.randn(num_gaussians, device=self.device) * self.init_density
-        self.densities_real = nn.Parameter(densities_real)
-        self.densities_imag = nn.Parameter(densities_imag)
-    
-    def initialize_from_image(
-        self,
-        image_complex: torch.Tensor,
-        threshold_ratio: float = 0.1,
-        max_gaussians: int = 50000,
-        min_gaussians: int = 5000
-    ):
-        """
-        使用欠采样图像的 iFFT 结果初始化高斯中心
-        
-        Args:
-            image_complex: (nz, nx, ny) 复数图像
-            threshold_ratio: 阈值比例，选择信号强度大于 max * ratio 的点
-            max_gaussians: 最大高斯数量
-            min_gaussians: 最小高斯数量
-        """
-        with torch.no_grad():
-            nz, nx, ny = image_complex.shape
-            
-            # 计算幅度
-            magnitude = torch.abs(image_complex)
-            threshold = magnitude.max() * threshold_ratio
-            
-            # 找到信号较强的点
-            mask = magnitude > threshold
-            indices = torch.nonzero(mask)  # (M, 3)
-            
-            num_points = len(indices)
-            print(f"[Model] Found {num_points} points above threshold")
-            
-            # 控制高斯数量
-            if num_points < min_gaussians:
-                # 如果点太少，降低阈值
-                sorted_mag = magnitude.flatten().sort(descending=True).values
-                threshold = sorted_mag[min(min_gaussians, len(sorted_mag) - 1)]
-                mask = magnitude > threshold
-                indices = torch.nonzero(mask)
-                print(f"[Model] Lowered threshold, now {len(indices)} points")
-            
-            if len(indices) > max_gaussians:
-                # 随机采样
-                perm = torch.randperm(len(indices))[:max_gaussians]
-                indices = indices[perm]
-                print(f"[Model] Sampled down to {max_gaussians} points")
-            
-            num_gaussians = len(indices)
-            print(f"[Model] Initializing {num_gaussians} Gaussians from image")
-            
-            # 将索引转换为归一化坐标 [-1, 1]
-            positions = torch.zeros(num_gaussians, 3, device=self.device)
-            positions[:, 0] = (indices[:, 0].float() / (nz - 1)) * 2 - 1
-            positions[:, 1] = (indices[:, 1].float() / (nx - 1)) * 2 - 1
-            positions[:, 2] = (indices[:, 2].float() / (ny - 1)) * 2 - 1
-            
-            # 获取对应点的复数值作为密度初始化
-            densities_complex = image_complex[indices[:, 0], indices[:, 1], indices[:, 2]]
-            densities_real = densities_complex.real
-            densities_imag = densities_complex.imag
-            
-            # 归一化密度
-            max_density = max(densities_real.abs().max(), densities_imag.abs().max())
-            if max_density > 0:
-                densities_real = densities_real / max_density * self.init_density * 10
-                densities_imag = densities_imag / max_density * self.init_density * 10
-            
-            # 重新初始化参数
-            self.num_gaussians = num_gaussians
-            self.positions = nn.Parameter(positions)
-            
-            # 尺度根据体素大小设置
-            voxel_scale = 2.0 / max(nz, nx, ny)
-            log_scales = torch.ones(num_gaussians, 3, device=self.device) * math.log(voxel_scale * 2)
-            self.log_scales = nn.Parameter(log_scales)
-            
-            rotations = torch.zeros(num_gaussians, 4, device=self.device)
-            rotations[:, 0] = 1.0
-            self.rotations = nn.Parameter(rotations)
-            
-            self.densities_real = nn.Parameter(densities_real)
-            self.densities_imag = nn.Parameter(densities_imag)
-            
-            self._cache_valid = False
-    
-    @property
-    def scales(self) -> torch.Tensor:
-        """获取实际尺度 (N, 3)"""
-        return torch.exp(self.log_scales)
-    
-    @property
-    def complex_densities(self) -> torch.Tensor:
-        """获取复数密度 (N,)"""
-        return torch.complex(self.densities_real, self.densities_imag)
-    
-    def quaternion_to_rotation_matrix(self, q: torch.Tensor) -> torch.Tensor:
-        """
-        将四元数转换为旋转矩阵
-        
-        Args:
-            q: (N, 4) 四元数 (w, x, y, z)
-            
-        Returns:
-            R: (N, 3, 3) 旋转矩阵
-        """
-        # 归一化四元数
-        q = F.normalize(q, dim=-1)
-        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-        
-        # 构建旋转矩阵
-        R = torch.zeros(len(q), 3, 3, device=q.device, dtype=q.dtype)
-        
-        R[:, 0, 0] = 1 - 2 * (y*y + z*z)
-        R[:, 0, 1] = 2 * (x*y - w*z)
-        R[:, 0, 2] = 2 * (x*z + w*y)
-        R[:, 1, 0] = 2 * (x*y + w*z)
-        R[:, 1, 1] = 1 - 2 * (x*x + z*z)
-        R[:, 1, 2] = 2 * (y*z - w*x)
-        R[:, 2, 0] = 2 * (x*z - w*y)
-        R[:, 2, 1] = 2 * (y*z + w*x)
-        R[:, 2, 2] = 1 - 2 * (x*x + y*y)
-        
-        return R
-    
-    def compute_covariance(self) -> torch.Tensor:
-        """
-        计算协方差矩阵
-        Σ = R @ S @ S^T @ R^T
-        
-        Returns:
-            cov: (N, 3, 3) 协方差矩阵
-        """
-        scales = self.scales  # (N, 3)
-        R = self.quaternion_to_rotation_matrix(self.rotations)  # (N, 3, 3)
-        
-        # S 是对角矩阵，S @ S^T = diag(scales^2)
-        S_sq = torch.diag_embed(scales ** 2)  # (N, 3, 3)
-        
-        # Σ = R @ S^2 @ R^T
-        cov = torch.bmm(torch.bmm(R, S_sq), R.transpose(1, 2))
-        
-        return cov
-    
-    def compute_covariance_inverse(self) -> torch.Tensor:
-        """
-        计算协方差矩阵的逆
-        
-        Returns:
-            cov_inv: (N, 3, 3) 协方差逆矩阵
-        """
-        scales = self.scales  # (N, 3)
-        R = self.quaternion_to_rotation_matrix(self.rotations)  # (N, 3, 3)
-        
-        # Σ^{-1} = R @ S^{-2} @ R^T
-        scales_inv_sq = 1.0 / (scales ** 2 + 1e-8)  # (N, 3)
-        S_inv_sq = torch.diag_embed(scales_inv_sq)  # (N, 3, 3)
-        
-        cov_inv = torch.bmm(torch.bmm(R, S_inv_sq), R.transpose(1, 2))
-        
-        return cov_inv
-    
-    def get_adaptive_stats(self) -> Dict:
-        """
-        获取用于自适应控制的统计信息
-        
-        Returns:
-            stats: 包含位置梯度、尺度等信息的字典
-        """
-        stats = {
-            'num_gaussians': self.num_gaussians,
-            'scales': self.scales.detach(),
-            'positions': self.positions.detach(),
-            'position_grad': self.positions.grad.detach() if self.positions.grad is not None else None,
-            'densities_magnitude': torch.abs(self.complex_densities).detach()
-        }
-        return stats
-    
-    def forward(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        前向传播，返回所有高斯参数
-        
-        Returns:
-            positions: (N, 3)
-            cov_inv: (N, 3, 3) 协方差逆矩阵
-            densities_real: (N,)
-            densities_imag: (N,)
-        """
-        cov_inv = self.compute_covariance_inverse()
-        return self.positions, cov_inv, self.densities_real, self.densities_imag
+from data_read import image_to_kspace
 
 
 class Voxelizer(nn.Module):
+    """将 Gaussians 体素化为 3D complex volume。
+
+    Baseline 实现：纯 PyTorch，对每个 Gaussian 计算其 3-sigma bbox 内的贡献。
+
+    体素化公式：
+    X_hat(v) = sum_i rho_i * exp(-0.5 * (x - p_i)^T Σ_i^{-1} (x - p_i))
+
+    当前实现：axis-aligned covariance（无旋转）
+    Σ_i = diag(scale_i^2)
     """
-    3D 高斯体素化器 (显存优化版)
-    
-    将 3D 高斯投影到体素网格:
-    x_j = Σ_i ρ_i · exp(-0.5 · (j - p_i)^T Σ_i^{-1} (j - p_i))
-    
-    使用可分离高斯近似，将 3D 高斯分解为三个 1D 高斯的乘积
-    这大大减少了计算量和显存占用
-    """
-    
+
     def __init__(
         self,
         volume_shape: Tuple[int, int, int],
-        device: str = 'cuda',
-        chunk_size: int = 256,
-        voxel_chunk_size: int = 50000,
-        cutoff_sigma: float = 3.0
+        device: str = "cuda",
+        sigma_cutoff: float = 3.0,
+        use_rotation: bool = False,  # 预留接口，baseline 不启用
     ):
         """
         Args:
-            volume_shape: (nz, nx, ny) 体素网格形状
+            volume_shape: (nz, nx, ny) 目标 volume 形状
             device: 目标设备
-            chunk_size: 分块处理的高斯数量
-            voxel_chunk_size: 未使用，保留以兼容旧接口
-            cutoff_sigma: 高斯截断距离
+            sigma_cutoff: 截断范围（几倍 sigma）
+            use_rotation: 是否启用旋转（当前 baseline 为 False）
         """
         super().__init__()
-        
-        self.volume_shape = volume_shape
+        self.nz, self.nx, self.ny = volume_shape
         self.device = device
-        self.chunk_size = chunk_size
-        self.cutoff_sigma = cutoff_sigma
-        
-        nz, nx, ny = volume_shape
-        self.nz, self.nx, self.ny = nz, nx, ny
-        self.num_voxels = nz * nx * ny
-        
-        # 预计算各轴坐标 [-1, 1]
-        self.register_buffer('z_coords', torch.linspace(-1, 1, nz, device=device))
-        self.register_buffer('x_coords', torch.linspace(-1, 1, nx, device=device))
-        self.register_buffer('y_coords', torch.linspace(-1, 1, ny, device=device))
-    
+        self.sigma_cutoff = sigma_cutoff
+        self.use_rotation = use_rotation
+
+        # 预计算归一化坐标网格
+        # 坐标范围 [-1, 1]
+        z = torch.linspace(-1, 1, self.nz, device=device)
+        x = torch.linspace(-1, 1, self.nx, device=device)
+        y = torch.linspace(-1, 1, self.ny, device=device)
+
+        # 体素间距（在 [-1, 1] 空间中）
+        self.voxel_size_z = 2.0 / (self.nz - 1) if self.nz > 1 else 2.0
+        self.voxel_size_x = 2.0 / (self.nx - 1) if self.nx > 1 else 2.0
+        self.voxel_size_y = 2.0 / (self.ny - 1) if self.ny > 1 else 2.0
+
+        # 存储坐标轴（不需要完整网格，节省显存）
+        self.register_buffer("coord_z", z)
+        self.register_buffer("coord_x", x)
+        self.register_buffer("coord_y", y)
+
     def forward(
         self,
-        positions: torch.Tensor,
-        cov_inv: torch.Tensor,
-        densities_real: torch.Tensor,
-        densities_imag: torch.Tensor
+        centers: torch.Tensor,  # (M, 3)
+        scales: torch.Tensor,   # (M, 3) 实际 scale（已 exp）
+        rho_real: torch.Tensor, # (M,)
+        rho_imag: torch.Tensor, # (M,)
+        rotations: Optional[torch.Tensor] = None,  # (M, 4) quaternion，当前不使用
     ) -> torch.Tensor:
+        """体素化 Gaussians 为 3D complex volume。
+
+        Args:
+            centers: (M, 3) Gaussian 中心坐标（[-1, 1] 空间）
+            scales: (M, 3) 各轴 scale（正数）
+            rho_real: (M,) complex density 实部
+            rho_imag: (M,) complex density 虚部
+            rotations: (M, 4) quaternion（当前 baseline 忽略）
+
+        Returns:
+            volume: (nz, nx, ny) complex64 张量
         """
-        体素化高斯到 3D 网格 (使用可分离高斯近似)
-        
-        对于轴对齐的高斯（无旋转），可以分解为三个 1D 高斯的乘积。
-        这里我们使用近似方法，先不考虑旋转，利用对角协方差。
-        """
-        num_gaussians = positions.shape[0]
-        nz, nx, ny = self.nz, self.nx, self.ny
-        
-        # 初始化输出体积
-        volume_real = torch.zeros(nz, nx, ny, device=self.device)
-        volume_imag = torch.zeros(nz, nx, ny, device=self.device)
-        
-        # 从协方差逆矩阵提取对角元素作为各轴的精度(1/σ²)
-        # cov_inv 是 (N, 3, 3)，对角元素是各轴的 1/σ²
-        precision_z = cov_inv[:, 0, 0]  # (N,)
-        precision_x = cov_inv[:, 1, 1]  # (N,)
-        precision_y = cov_inv[:, 2, 2]  # (N,)
-        
-        # 分块处理高斯
-        for g_start in range(0, num_gaussians, self.chunk_size):
-            g_end = min(g_start + self.chunk_size, num_gaussians)
-            chunk_size = g_end - g_start
-            
-            # 获取当前块的参数
-            pos_chunk = positions[g_start:g_end]  # (G, 3)
-            prec_z = precision_z[g_start:g_end]   # (G,)
-            prec_x = precision_x[g_start:g_end]   # (G,)
-            prec_y = precision_y[g_start:g_end]   # (G,)
-            dens_r = densities_real[g_start:g_end]  # (G,)
-            dens_i = densities_imag[g_start:g_end]  # (G,)
-            
-            # 计算各轴的 1D 高斯响应
-            # z_diff: (nz, G)
-            z_diff = self.z_coords.unsqueeze(1) - pos_chunk[:, 0].unsqueeze(0)
-            z_response = torch.exp(-0.5 * prec_z.unsqueeze(0) * z_diff ** 2)  # (nz, G)
-            del z_diff
-            
-            # x_diff: (nx, G)
-            x_diff = self.x_coords.unsqueeze(1) - pos_chunk[:, 1].unsqueeze(0)
-            x_response = torch.exp(-0.5 * prec_x.unsqueeze(0) * x_diff ** 2)  # (nx, G)
-            del x_diff
-            
-            # y_diff: (ny, G)
-            y_diff = self.y_coords.unsqueeze(1) - pos_chunk[:, 2].unsqueeze(0)
-            y_response = torch.exp(-0.5 * prec_y.unsqueeze(0) * y_diff ** 2)  # (ny, G)
-            del y_diff
-            
-            # 3D 响应 = z_response ⊗ x_response ⊗ y_response
-            # 使用 einsum 计算 (nz, nx, ny, G)
-            # 为了节省内存，我们不显式构建 4D 张量，而是直接计算加权和
-            # volume += sum_g(dens_g * z_g ⊗ x_g ⊗ y_g)
-            # = sum_g(dens_g) * (z ⊗ x ⊗ y) 当各高斯独立时
-            # 使用 einsum: 'zg,xg,yg,g->zxy'
-            
-            contrib_real = torch.einsum('zg,xg,yg,g->zxy', z_response, x_response, y_response, dens_r)
-            contrib_imag = torch.einsum('zg,xg,yg,g->zxy', z_response, x_response, y_response, dens_i)
-            
-            volume_real = volume_real + contrib_real
-            volume_imag = volume_imag + contrib_imag
-            
-            # 释放中间变量
-            del z_response, x_response, y_response, contrib_real, contrib_imag
-        
-        # 组合为复数
-        volume = torch.complex(volume_real, volume_imag)
-        
-        return volume
+        M = centers.shape[0]
+
+        # 初始化输出 volume
+        volume_real = torch.zeros(self.nz, self.nx, self.ny, device=self.device)
+        volume_imag = torch.zeros(self.nz, self.nx, self.ny, device=self.device)
+
+        # 对每个 Gaussian，计算其 bbox 内的贡献
+        # 为了避免 for 循环太慢，我们按 batch 处理
+        # 但为了避免显存爆炸，每次处理一定数量的 Gaussians
+
+        batch_size = min(M, 64)  # 每批处理的 Gaussian 数量
+
+        for batch_start in range(0, M, batch_size):
+            batch_end = min(batch_start + batch_size, M)
+            batch_indices = torch.arange(batch_start, batch_end, device=self.device)
+
+            self._process_gaussian_batch(
+                centers[batch_indices],
+                scales[batch_indices],
+                rho_real[batch_indices],
+                rho_imag[batch_indices],
+                volume_real,
+                volume_imag,
+            )
+
+        return torch.complex(volume_real, volume_imag)
+
+    def _process_gaussian_batch(
+        self,
+        centers: torch.Tensor,  # (B, 3)
+        scales: torch.Tensor,   # (B, 3)
+        rho_real: torch.Tensor, # (B,)
+        rho_imag: torch.Tensor, # (B,)
+        volume_real: torch.Tensor,  # (nz, nx, ny) 累加目标
+        volume_imag: torch.Tensor,  # (nz, nx, ny) 累加目标
+    ):
+        """处理一批 Gaussians，累加到 volume。"""
+        B = centers.shape[0]
+
+        for i in range(B):
+            center = centers[i]  # (3,)
+            scale = scales[i]    # (3,)
+            rho_r = rho_real[i]
+            rho_i = rho_imag[i]
+
+            # 计算 3-sigma bbox（在 [-1, 1] 空间）
+            sigma = scale  # axis-aligned: scale 就是 sigma
+            max_sigma = sigma.max().item()
+            radius = self.sigma_cutoff * max_sigma
+
+            # 转换为体素索引范围
+            cz, cx, cy = center[0].item(), center[1].item(), center[2].item()
+
+            # 坐标到索引映射：idx = (coord + 1) / 2 * (N - 1)
+            def coord_to_idx(coord, N):
+                return (coord + 1) / 2 * (N - 1)
+
+            def idx_to_coord(idx, N):
+                return idx / (N - 1) * 2 - 1
+
+            # 中心索引
+            cz_idx = coord_to_idx(cz, self.nz)
+            cx_idx = coord_to_idx(cx, self.nx)
+            cy_idx = coord_to_idx(cy, self.ny)
+
+            # bbox 半径（体素数）
+            rz = int(np.ceil(radius / self.voxel_size_z)) + 1
+            rx = int(np.ceil(radius / self.voxel_size_x)) + 1
+            ry = int(np.ceil(radius / self.voxel_size_y)) + 1
+
+            # 索引范围
+            z_start = max(0, int(cz_idx) - rz)
+            z_end = min(self.nz, int(cz_idx) + rz + 1)
+            x_start = max(0, int(cx_idx) - rx)
+            x_end = min(self.nx, int(cx_idx) + rx + 1)
+            y_start = max(0, int(cy_idx) - ry)
+            y_end = min(self.ny, int(cy_idx) + ry + 1)
+
+            if z_start >= z_end or x_start >= x_end or y_start >= y_end:
+                continue
+
+            # 提取局部坐标
+            local_z = self.coord_z[z_start:z_end]  # (Lz,)
+            local_x = self.coord_x[x_start:x_end]  # (Lx,)
+            local_y = self.coord_y[y_start:y_end]  # (Ly,)
+
+            # 构建局部网格
+            LZ, LX, LY = torch.meshgrid(local_z, local_x, local_y, indexing="ij")
+
+            # 计算到中心的距离（axis-aligned）
+            dz = (LZ - center[0]) / (scale[0] + 1e-8)
+            dx = (LX - center[1]) / (scale[1] + 1e-8)
+            dy = (LY - center[2]) / (scale[2] + 1e-8)
+
+            # Gaussian 权重：exp(-0.5 * (dz^2 + dx^2 + dy^2))
+            dist_sq = dz**2 + dx**2 + dy**2
+            weight = torch.exp(-0.5 * dist_sq)
+
+            # 截断（3-sigma 外设为 0）
+            weight = weight * (dist_sq <= self.sigma_cutoff**2).float()
+
+            # 累加到全局 volume
+            volume_real[z_start:z_end, x_start:x_end, y_start:y_end] += rho_r * weight
+            volume_imag[z_start:z_end, x_start:x_end, y_start:y_end] += rho_i * weight
 
 
-class VoxelizerOptimized(nn.Module):
+class GaussianMRIModel(nn.Module):
+    """3D Gaussian Splatting for MRI Reconstruction 主模型。
+
+    包含：
+    - Gaussian 参数（centers, log_scales, rho_real, rho_imag, rotations）
+    - Voxelizer
+    - MRI forward operator
+    - Densification / Pruning
     """
-    优化版体素化器，使用稀疏计算减少显存占用
-    
-    对于每个高斯，只计算其影响范围内的体素
-    """
-    
+
     def __init__(
         self,
         volume_shape: Tuple[int, int, int],
-        device: str = 'cuda',
-        cutoff_sigma: float = 3.0,
-        gaussian_batch_size: int = 256
-    ):
-        super().__init__()
-        
-        self.volume_shape = volume_shape
-        self.device = device
-        self.cutoff_sigma = cutoff_sigma
-        self.gaussian_batch_size = gaussian_batch_size
-        
-        nz, nx, ny = volume_shape
-        self.nz, self.nx, self.ny = nz, nx, ny
-        
-        # 体素坐标
-        z = torch.linspace(-1, 1, nz, device=device)
-        x = torch.linspace(-1, 1, nx, device=device)
-        y = torch.linspace(-1, 1, ny, device=device)
-        
-        self.register_buffer('z_coords', z)
-        self.register_buffer('x_coords', x)
-        self.register_buffer('y_coords', y)
-        
-        # 体素间距
-        self.voxel_size = torch.tensor([
-            2.0 / (nz - 1) if nz > 1 else 2.0,
-            2.0 / (nx - 1) if nx > 1 else 2.0,
-            2.0 / (ny - 1) if ny > 1 else 2.0
-        ], device=device)
-    
-    def forward(
-        self,
-        positions: torch.Tensor,
-        cov_inv: torch.Tensor,
-        densities_real: torch.Tensor,
-        densities_imag: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        体素化高斯（优化版）
-        """
-        num_gaussians = positions.shape[0]
-        nz, nx, ny = self.volume_shape
-        
-        # 复数密度
-        densities = torch.complex(densities_real, densities_imag)
-        
-        # 初始化输出
-        volume = torch.zeros(nz, nx, ny, dtype=torch.complex64, device=self.device)
-        
-        # 预计算所有体素坐标
-        Z, X, Y = torch.meshgrid(self.z_coords, self.x_coords, self.y_coords, indexing='ij')
-        voxel_coords = torch.stack([Z, X, Y], dim=-1)  # (nz, nx, ny, 3)
-        
-        # 分批处理高斯
-        for i in range(0, num_gaussians, self.gaussian_batch_size):
-            end_idx = min(i + self.gaussian_batch_size, num_gaussians)
-            batch_size = end_idx - i
-            
-            pos_batch = positions[i:end_idx]  # (batch, 3)
-            cov_inv_batch = cov_inv[i:end_idx]  # (batch, 3, 3)
-            dens_batch = densities[i:end_idx]  # (batch,)
-            
-            # 计算差值: (nz, nx, ny, batch, 3)
-            diff = voxel_coords.unsqueeze(3) - pos_batch.view(1, 1, 1, batch_size, 3)
-            
-            # 计算马氏距离
-            # (nz, nx, ny, batch, 3) @ (batch, 3, 3) -> (nz, nx, ny, batch, 3)
-            tmp = torch.einsum('...bi,bij->...bj', diff, cov_inv_batch)
-            mahal_sq = torch.einsum('...bi,...bi->...b', tmp, diff)  # (nz, nx, ny, batch)
-            
-            # 高斯响应
-            response = torch.exp(-0.5 * mahal_sq)  # (nz, nx, ny, batch)
-            
-            # 加权求和
-            contrib = torch.einsum('...b,b->...', response, dens_batch)
-            volume = volume + contrib
-        
-        return volume
-
-
-class AdaptiveController:
-    """
-    自适应控制器
-    
-    实现高斯的分裂 (Split) 和剪枝 (Prune) 策略
-    重点实现论文中的 "Long-axis Splitting"（长轴分裂）
-    """
-    
-    def __init__(
-        self,
-        split_grad_threshold: float = 0.0002,
-        split_scale_threshold: float = 0.01,
-        prune_density_threshold: float = 0.001,
-        prune_scale_threshold: float = 0.0005,
-        max_gaussians: int = 100000,
-        min_gaussians: int = 1000,
-        densify_interval: int = 100,
-        device: str = 'cuda'
+        n_gaussians: int = 1000,
+        device: str = "cuda",
+        sigma_cutoff: float = 3.0,
+        use_rotation: bool = False,
     ):
         """
         Args:
-            split_grad_threshold: 位置梯度阈值，超过则考虑分裂
-            split_scale_threshold: 尺度阈值，超过则执行分裂
-            prune_density_threshold: 密度阈值，低于则剪枝
-            prune_scale_threshold: 尺度阈值，低于则剪枝
-            max_gaussians: 最大高斯数量
-            min_gaussians: 最小高斯数量
-            densify_interval: 执行自适应控制的迭代间隔
+            volume_shape: (nz, nx, ny) 目标 volume 形状
+            n_gaussians: 初始 Gaussian 数量
             device: 目标设备
+            sigma_cutoff: Gaussian 截断范围
+            use_rotation: 是否启用旋转（baseline 为 False）
         """
-        self.split_grad_threshold = split_grad_threshold
-        self.split_scale_threshold = split_scale_threshold
-        self.prune_density_threshold = prune_density_threshold
-        self.prune_scale_threshold = prune_scale_threshold
-        self.max_gaussians = max_gaussians
-        self.min_gaussians = min_gaussians
-        self.densify_interval = densify_interval
+        super().__init__()
+        self.volume_shape = volume_shape
+        self.nz, self.nx, self.ny = volume_shape
         self.device = device
-        
-        # 累积梯度
-        self.accumulated_grad = None
-        self.grad_count = 0
-        
-        # 统计信息
-        self.last_split_count = 0
-        self.last_prune_count = 0
-    
-    def accumulate_gradients(self, model: ComplexGaussianModel):
-        """累积位置梯度"""
-        if model.positions.grad is not None:
-            grad = model.positions.grad.detach().abs()
-            if self.accumulated_grad is None:
-                self.accumulated_grad = grad
-            else:
-                # 确保维度匹配
-                if self.accumulated_grad.shape[0] != grad.shape[0]:
-                    self.accumulated_grad = grad
-                else:
-                    self.accumulated_grad = self.accumulated_grad + grad
-            self.grad_count += 1
-    
-    def reset_gradients(self):
-        """重置累积梯度"""
-        self.accumulated_grad = None
-        self.grad_count = 0
-    
-    def should_densify(self, iteration: int) -> bool:
-        """是否应该执行自适应控制"""
-        return iteration > 0 and iteration % self.densify_interval == 0
-    
+        self.use_rotation = use_rotation
+
+        # Voxelizer
+        self.voxelizer = Voxelizer(
+            volume_shape=volume_shape,
+            device=device,
+            sigma_cutoff=sigma_cutoff,
+            use_rotation=use_rotation,
+        )
+
+        # 初始化 Gaussian 参数（将在 initialize_from_image 中设置）
+        self._init_gaussian_params(n_gaussians)
+
+    def _init_gaussian_params(self, n_gaussians: int):
+        """初始化 Gaussian 参数为随机值。"""
+        # Centers: [-1, 1] 范围
+        centers = torch.rand(n_gaussians, 3, device=self.device) * 2 - 1
+        self.centers = nn.Parameter(centers)
+
+        # Log scales: 初始化为较小的值
+        log_scales = torch.full((n_gaussians, 3), -3.0, device=self.device)
+        self.log_scales = nn.Parameter(log_scales)
+
+        # Complex density (real + imag)
+        rho_real = torch.randn(n_gaussians, device=self.device) * 0.01
+        rho_imag = torch.randn(n_gaussians, device=self.device) * 0.01
+        self.rho_real = nn.Parameter(rho_real)
+        self.rho_imag = nn.Parameter(rho_imag)
+
+        # Rotations (quaternion): 固定为 identity（预留接口）
+        # [w, x, y, z] 格式，identity = [1, 0, 0, 0]
+        rotations = torch.zeros(n_gaussians, 4, device=self.device)
+        rotations[:, 0] = 1.0
+        if self.use_rotation:
+            self.rotations = nn.Parameter(rotations)
+        else:
+            self.register_buffer("rotations", rotations)
+
+    def initialize_from_image(
+        self,
+        image_init_complex: torch.Tensor,  # (nz, nx, ny) complex
+        n_gaussians: int,
+        percentile_thresh: float = 10.0,
+        k_init: float = 1.0,
+        seed: int = 42,
+    ):
+        """从初始复数图像初始化 Gaussian 参数。
+
+        步骤：
+        1. 背景过滤：从 abs(x0) 里按阈值保留高能体素
+        2. 从保留体素中随机采样 M 个点作为 centers
+        3. 初始化 rho = k_init * x0_at_point
+        4. 初始化 scale 为到最近邻的平均距离
+        5. rotation 固定为 identity
+
+        Args:
+            image_init_complex: (nz, nx, ny) 初始复数图像
+            n_gaussians: Gaussian 数量
+            percentile_thresh: 背景过滤阈值（百分位）
+            k_init: density 初始化系数
+            seed: 随机种子
+        """
+        torch.manual_seed(seed)
+
+        # 获取 magnitude
+        mag = torch.abs(image_init_complex)  # (nz, nx, ny)
+
+        # 背景过滤：保留高于阈值的体素
+        thresh = torch.quantile(mag.flatten(), percentile_thresh / 100.0)
+        valid_mask = mag > thresh  # (nz, nx, ny) bool
+
+        # 获取有效体素的索引
+        valid_indices = torch.nonzero(valid_mask, as_tuple=False)  # (N_valid, 3)
+
+        if valid_indices.shape[0] < n_gaussians:
+            print(f"[Model] Warning: only {valid_indices.shape[0]} valid voxels, "
+                  f"using all of them instead of {n_gaussians}")
+            n_gaussians = valid_indices.shape[0]
+
+        # 随机采样
+        perm = torch.randperm(valid_indices.shape[0], device=self.device)[:n_gaussians]
+        sampled_indices = valid_indices[perm]  # (M, 3)
+
+        # 转换为归一化坐标 [-1, 1]
+        centers = torch.zeros(n_gaussians, 3, device=self.device)
+        centers[:, 0] = sampled_indices[:, 0].float() / (self.nz - 1) * 2 - 1  # z
+        centers[:, 1] = sampled_indices[:, 1].float() / (self.nx - 1) * 2 - 1  # x
+        centers[:, 2] = sampled_indices[:, 2].float() / (self.ny - 1) * 2 - 1  # y
+
+        # 获取采样点的复数值
+        sampled_values = image_init_complex[
+            sampled_indices[:, 0],
+            sampled_indices[:, 1],
+            sampled_indices[:, 2],
+        ]  # (M,) complex
+
+        # 初始化 rho
+        rho_real = k_init * sampled_values.real
+        rho_imag = k_init * sampled_values.imag
+
+        # 初始化 scale：计算到 k 个最近邻的平均距离
+        log_scales = self._compute_initial_scales(centers, k_neighbors=3)
+
+        # 设置参数
+        self.centers = nn.Parameter(centers)
+        self.log_scales = nn.Parameter(log_scales)
+        self.rho_real = nn.Parameter(rho_real)
+        self.rho_imag = nn.Parameter(rho_imag)
+
+        # Rotations: identity
+        rotations = torch.zeros(n_gaussians, 4, device=self.device)
+        rotations[:, 0] = 1.0
+        if self.use_rotation:
+            self.rotations = nn.Parameter(rotations)
+        else:
+            self.register_buffer("rotations", rotations)
+
+        print(f"[Model] Initialized {n_gaussians} Gaussians from image")
+
+    def _compute_initial_scales(
+        self,
+        centers: torch.Tensor,  # (M, 3)
+        k_neighbors: int = 3,
+    ) -> torch.Tensor:
+        """计算初始 log_scale：到 k 个最近邻的平均距离。"""
+        M = centers.shape[0]
+
+        if M <= k_neighbors:
+            # 如果点太少，使用默认值
+            voxel_size = 2.0 / max(self.nz, self.nx, self.ny)
+            default_scale = voxel_size * 2
+            return torch.full((M, 3), math.log(default_scale), device=self.device)
+
+        # 计算两两距离
+        # 为避免显存问题，使用分块计算或近似
+        if M > 5000:
+            # 对大量点使用随机采样近似
+            sample_size = min(1000, M)
+            sample_idx = torch.randperm(M, device=self.device)[:sample_size]
+            sample_centers = centers[sample_idx]
+
+            dists = torch.cdist(centers, sample_centers)  # (M, sample_size)
+            # 排除自身（如果在采样中）
+            dists = dists + torch.eye(M, sample_size, device=self.device)[:M, :sample_size] * 1e10
+        else:
+            dists = torch.cdist(centers, centers)  # (M, M)
+            # 排除自身
+            dists = dists + torch.eye(M, device=self.device) * 1e10
+
+        # 取 k 个最近邻的平均距离
+        k = min(k_neighbors, dists.shape[1] - 1)
+        knn_dists, _ = torch.topk(dists, k, dim=1, largest=False)
+        avg_dist = knn_dists.mean(dim=1)  # (M,)
+
+        # 避免过小的 scale
+        min_scale = 2.0 / max(self.nz, self.nx, self.ny) * 0.5
+        avg_dist = torch.clamp(avg_dist, min=min_scale)
+
+        # 各向同性初始化
+        log_scales = torch.log(avg_dist).unsqueeze(1).expand(-1, 3)
+
+        return log_scales.clone()
+
+    @property
+    def scales(self) -> torch.Tensor:
+        """获取实际 scale（exp(log_scale)）。"""
+        return torch.exp(self.log_scales)
+
+    @property
+    def n_gaussians(self) -> int:
+        """当前 Gaussian 数量。"""
+        return self.centers.shape[0]
+
+    def voxelize(self) -> torch.Tensor:
+        """将当前 Gaussians 体素化为 3D complex volume。
+
+        Returns:
+            volume: (nz, nx, ny) complex64
+        """
+        return self.voxelizer(
+            self.centers,
+            self.scales,
+            self.rho_real,
+            self.rho_imag,
+            self.rotations if self.use_rotation else None,
+        )
+
+    def forward_mri(
+        self,
+        volume: torch.Tensor,  # (nz, nx, ny) complex
+        mask: torch.Tensor,    # (nz, nx, ny) float
+    ) -> torch.Tensor:
+        """MRI forward operator: A(X) = mask ⊙ FFT3(X)
+
+        使用 data_read.image_to_kspace() 确保一致性。
+
+        Args:
+            volume: (nz, nx, ny) 复数图像
+            mask: (nz, nx, ny) 采样 mask
+
+        Returns:
+            kspace_masked: (nz, nx, ny) complex
+        """
+        kspace = image_to_kspace(volume)
+        return mask * kspace
+
+    def forward(
+        self,
+        mask: torch.Tensor,  # (nz, nx, ny) float
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """前向传播：体素化 + MRI forward。
+
+        Returns:
+            volume: (nz, nx, ny) complex - 重建的复数图像
+            kspace_pred: (nz, nx, ny) complex - 预测的欠采样 k-space
+        """
+        volume = self.voxelize()
+        kspace_pred = self.forward_mri(volume, mask)
+        return volume, kspace_pred
+
+    def compute_loss(
+        self,
+        kspace_pred: torch.Tensor,   # (nz, nx, ny) complex
+        kspace_target: torch.Tensor, # (nz, nx, ny) complex
+        mask: torch.Tensor,          # (nz, nx, ny) float
+        volume: Optional[torch.Tensor] = None,  # (nz, nx, ny) complex
+        lambda_tv: float = 0.0,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """计算损失函数。
+
+        L = L_dc + lambda_tv * L_tv
+
+        L_dc = mean(|mask ⊙ (kspace_pred - kspace_target)|^2)
+        L_tv = TV(|volume|)
+
+        Args:
+            kspace_pred: 预测 k-space
+            kspace_target: 目标 k-space
+            mask: 采样 mask
+            volume: 重建图像（用于 TV，如果 None 则不计算 TV）
+            lambda_tv: TV 正则系数
+
+        Returns:
+            loss: 总损失
+            loss_dict: 各项损失的字典
+        """
+        # Data consistency loss
+        diff = mask * (kspace_pred - kspace_target)
+        loss_dc = torch.mean(torch.abs(diff) ** 2)
+
+        loss_dict = {"loss_dc": loss_dc.item()}
+
+        # TV regularization
+        loss_tv = torch.tensor(0.0, device=self.device)
+        if lambda_tv > 0 and volume is not None:
+            from utils import total_variation_3d
+            loss_tv = total_variation_3d(torch.abs(volume))
+            loss_dict["loss_tv"] = loss_tv.item()
+
+        # Total loss
+        loss = loss_dc + lambda_tv * loss_tv
+        loss_dict["loss_total"] = loss.item()
+
+        return loss, loss_dict
+
+    # ========================================================================
+    # Adaptive Control: Densification & Pruning
+    # ========================================================================
+
+    def compute_center_gradients_norm(self) -> torch.Tensor:
+        """计算 centers 梯度的 L2 范数。
+
+        Returns:
+            grad_norms: (M,) 每个 Gaussian center 的梯度范数
+        """
+        if self.centers.grad is None:
+            return torch.zeros(self.n_gaussians, device=self.device)
+
+        grad_norms = torch.norm(self.centers.grad, dim=1)
+        return grad_norms
+
     def densify_and_prune(
         self,
-        model: ComplexGaussianModel,
-        optimizer: torch.optim.Optimizer
-    ) -> Dict:
-        """
-        执行分裂和剪枝
-        
+        grad_threshold: float = 0.01,
+        prune_rho_thresh: float = 0.001,
+        max_gaussians: int = 50000,
+        min_gaussians: int = 64,
+        split_scale_factor: float = 0.7,
+        split_delta_factor: float = 0.5,
+    ) -> Dict[str, int]:
+        """执行 densification 和 pruning。
+
+        Densification（Long-axis splitting）:
+        - 对梯度范数 > grad_threshold 的 Gaussian 进行分裂
+        - 沿 scale 最大的轴方向分裂
+
+        Pruning:
+        - 删除 |rho| < prune_rho_thresh 的 Gaussian
+
         Args:
-            model: 高斯模型
-            optimizer: 优化器
-            
+            grad_threshold: 分裂触发的梯度阈值
+            prune_rho_thresh: 删除阈值
+            max_gaussians: 最大 Gaussian 数量
+            min_gaussians: pruning 后至少保留的 Gaussian 数量
+            split_scale_factor: 分裂后 scale 缩小系数
+            split_delta_factor: 分裂位移系数（delta = factor * sigma_k）
+
         Returns:
-            stats: 包含分裂和剪枝数量的字典
-        """
-        if self.accumulated_grad is None or self.grad_count == 0:
-            return {'split': 0, 'prune': 0, 'total': model.num_gaussians}
-        
-        # 平均梯度
-        avg_grad = self.accumulated_grad / self.grad_count
-        grad_norm = avg_grad.norm(dim=-1)  # (N,)
-        
-        scales = model.scales.detach()  # (N, 3)
-        densities_mag = torch.abs(model.complex_densities).detach()  # (N,)
-        
-        # === 分裂 (Long-axis Splitting) ===
-        # 条件: 梯度大 AND 尺度大
-        large_grad_mask = grad_norm > self.split_grad_threshold
-        max_scale = scales.max(dim=-1).values  # (N,)
-        large_scale_mask = max_scale > self.split_scale_threshold
-        
-        split_mask = large_grad_mask & large_scale_mask
-        
-        # 限制分裂数量
-        current_count = model.num_gaussians
-        max_new = max(0, self.max_gaussians - current_count)
-        split_indices = torch.where(split_mask)[0]
-        
-        if len(split_indices) > max_new:
-            # 选择梯度最大的点进行分裂
-            _, top_indices = torch.topk(grad_norm[split_indices], max_new)
-            split_indices = split_indices[top_indices]
-        
-        self.last_split_count = len(split_indices)
-        
-        # === 剪枝 ===
-        # 条件: 密度太小 OR 尺度太小
-        small_density_mask = densities_mag < self.prune_density_threshold
-        small_scale_mask = max_scale < self.prune_scale_threshold
-        
-        prune_mask = small_density_mask | small_scale_mask
-        
-        # 确保保留最小数量
-        num_to_keep = max(self.min_gaussians, current_count - prune_mask.sum().item())
-        
-        prune_indices = torch.where(prune_mask)[0]
-        
-        # 如果剪枝太多，保留密度最大的
-        if current_count - len(prune_indices) < self.min_gaussians:
-            num_to_prune = max(0, current_count - self.min_gaussians)
-            if num_to_prune > 0 and len(prune_indices) > 0:
-                _, bottom_indices = torch.topk(densities_mag[prune_indices], 
-                                               min(num_to_prune, len(prune_indices)), 
-                                               largest=False)
-                prune_indices = prune_indices[bottom_indices]
-            else:
-                prune_indices = torch.tensor([], dtype=torch.long, device=self.device)
-        
-        self.last_prune_count = len(prune_indices)
-        
-        # === 执行分裂和剪枝 ===
-        if len(split_indices) > 0 or len(prune_indices) > 0:
-            self._apply_densification(model, optimizer, split_indices, prune_indices)
-        
-        # 重置梯度累积
-        self.reset_gradients()
-        
-        return {
-            'split': self.last_split_count,
-            'prune': self.last_prune_count,
-            'total': model.num_gaussians
-        }
-    
-    def _apply_densification(
-        self,
-        model: ComplexGaussianModel,
-        optimizer: torch.optim.Optimizer,
-        split_indices: torch.Tensor,
-        prune_indices: torch.Tensor
-    ):
-        """
-        应用分裂和剪枝操作
-        
-        实现 Long-axis Splitting: 沿最长轴分裂为两个不重叠的高斯
+            stats: 包含 n_split, n_pruned, n_final 的字典
         """
         with torch.no_grad():
-            # 获取当前参数
-            old_positions = model.positions.data.clone()
-            old_log_scales = model.log_scales.data.clone()
-            old_rotations = model.rotations.data.clone()
-            old_densities_real = model.densities_real.data.clone()
-            old_densities_imag = model.densities_imag.data.clone()
-            
-            old_scales = model.scales.clone()
-            
-            # === 创建分裂后的新高斯 ===
-            new_positions_list = []
-            new_log_scales_list = []
-            new_rotations_list = []
-            new_densities_real_list = []
-            new_densities_imag_list = []
-            
-            for idx in split_indices:
-                idx = idx.item()
-                pos = old_positions[idx]  # (3,)
-                scales = old_scales[idx]  # (3,)
-                rotation = old_rotations[idx]  # (4,)
-                dens_real = old_densities_real[idx]
-                dens_imag = old_densities_imag[idx]
-                
-                # 找到最长轴
-                longest_axis = torch.argmax(scales).item()
-                
-                # 沿最长轴偏移
-                offset = torch.zeros(3, device=self.device)
-                offset[longest_axis] = scales[longest_axis] * 0.5  # 偏移半个尺度
-                
-                # 创建两个新高斯（替换原来的）
-                # 新高斯 1: 沿正方向偏移
-                new_pos_1 = pos + offset
-                # 新高斯 2: 沿负方向偏移
-                new_pos_2 = pos - offset
-                
-                # 新尺度: 沿分裂轴缩小一半
-                new_scales = scales.clone()
-                new_scales[longest_axis] = scales[longest_axis] * 0.5
-                new_log_scale = torch.log(new_scales + 1e-8)
-                
-                # 密度减半
-                new_dens_real = dens_real * 0.5
-                new_dens_imag = dens_imag * 0.5
-                
-                # 添加两个新高斯
-                new_positions_list.extend([new_pos_1, new_pos_2])
-                new_log_scales_list.extend([new_log_scale, new_log_scale.clone()])
-                new_rotations_list.extend([rotation.clone(), rotation.clone()])
-                new_densities_real_list.extend([new_dens_real, new_dens_real])
-                new_densities_imag_list.extend([new_dens_imag, new_dens_imag])
-            
-            # === 标记要删除的索引 ===
-            # 分裂的点会被新点替代，所以要删除
-            delete_mask = torch.zeros(len(old_positions), dtype=torch.bool, device=self.device)
-            if len(split_indices) > 0:
-                delete_mask[split_indices] = True
-            if len(prune_indices) > 0:
-                delete_mask[prune_indices] = True
-            
-            keep_mask = ~delete_mask
-            
-            # 保留的旧高斯
-            kept_positions = old_positions[keep_mask]
-            kept_log_scales = old_log_scales[keep_mask]
-            kept_rotations = old_rotations[keep_mask]
-            kept_densities_real = old_densities_real[keep_mask]
-            kept_densities_imag = old_densities_imag[keep_mask]
-            
-            # 合并新旧高斯
-            if len(new_positions_list) > 0:
-                new_positions = torch.stack(new_positions_list)
-                new_log_scales = torch.stack(new_log_scales_list)
-                new_rotations = torch.stack(new_rotations_list)
-                new_densities_real = torch.stack(new_densities_real_list)
-                new_densities_imag = torch.stack(new_densities_imag_list)
-                
-                final_positions = torch.cat([kept_positions, new_positions], dim=0)
-                final_log_scales = torch.cat([kept_log_scales, new_log_scales], dim=0)
-                final_rotations = torch.cat([kept_rotations, new_rotations], dim=0)
-                final_densities_real = torch.cat([kept_densities_real, new_densities_real], dim=0)
-                final_densities_imag = torch.cat([kept_densities_imag, new_densities_imag], dim=0)
-            else:
-                final_positions = kept_positions
-                final_log_scales = kept_log_scales
-                final_rotations = kept_rotations
-                final_densities_real = kept_densities_real
-                final_densities_imag = kept_densities_imag
-            
-            # 更新模型参数
-            new_num = len(final_positions)
-            model.num_gaussians = new_num
-            
-            # 更新参数
-            model.positions = nn.Parameter(final_positions)
-            model.log_scales = nn.Parameter(final_log_scales)
-            model.rotations = nn.Parameter(final_rotations)
-            model.densities_real = nn.Parameter(final_densities_real)
-            model.densities_imag = nn.Parameter(final_densities_imag)
-            
-            # 更新优化器的参数组
-            # 简单起见，重新创建参数组
-            optimizer.param_groups.clear()
-            optimizer.param_groups.append({
-                'params': list(model.parameters()),
-                'lr': optimizer.defaults['lr']
-            })
-            
-            # 重置优化器状态
-            optimizer.state.clear()
+            stats = {"n_split": 0, "n_pruned": 0, "n_final": self.n_gaussians}
 
+            if self.n_gaussians == 0:
+                return stats
 
-def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
-    """
-    计算 PSNR
-    
-    Args:
-        pred: 预测图像
-        target: 目标图像
-        
-    Returns:
-        psnr: PSNR 值 (dB)
-    """
-    mse = torch.mean((torch.abs(pred) - torch.abs(target)) ** 2)
-    if mse == 0:
-        return float('inf')
-    max_val = torch.max(torch.abs(target))
-    psnr = 20 * torch.log10(max_val / torch.sqrt(mse))
-    return psnr.item()
+            # 1. Pruning: 删除低 density 的点
+            rho_mag = torch.sqrt(self.rho_real**2 + self.rho_imag**2)
+            keep_mask = rho_mag >= prune_rho_thresh
+            n_pruned = (~keep_mask).sum().item()
+            stats["n_pruned"] = n_pruned
 
+            # 至少保留 min_gaussians 个（按 rho 能量最高）
+            if keep_mask.sum() < min_gaussians:
+                topk = torch.topk(rho_mag, k=min(self.n_gaussians, min_gaussians)).indices
+                keep_mask[topk] = True
 
-def compute_ssim(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11) -> float:
-    """
-    计算 SSIM (简化版本，用于 3D 数据)
-    
-    Args:
-        pred: 预测图像
-        target: 目标图像
-        window_size: 窗口大小
-        
-    Returns:
-        ssim: SSIM 值
-    """
-    # 转换为实数（取幅度）
-    pred_abs = torch.abs(pred).float()
-    target_abs = torch.abs(target).float()
-    
-    # 常量
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
-    
-    # 简单的均值和方差计算
-    mu_pred = pred_abs.mean()
-    mu_target = target_abs.mean()
-    
-    sigma_pred = ((pred_abs - mu_pred) ** 2).mean()
-    sigma_target = ((target_abs - mu_target) ** 2).mean()
-    sigma_cross = ((pred_abs - mu_pred) * (target_abs - mu_target)).mean()
-    
-    ssim = ((2 * mu_pred * mu_target + C1) * (2 * sigma_cross + C2)) / \
-           ((mu_pred ** 2 + mu_target ** 2 + C1) * (sigma_pred + sigma_target + C2))
-    
-    return ssim.item()
+            if n_pruned > 0:
+                self._prune_gaussians(keep_mask)
+
+            # 如果被 prune 到空，直接返回，避免后续计算空 tensor 的 max
+            if self.n_gaussians == 0:
+                stats["n_final"] = 0
+                return stats
+
+            # 2. Densification: 分裂高梯度的点
+            if self.n_gaussians < max_gaussians:
+                grad_norms = self.compute_center_gradients_norm()
+
+                # 归一化梯度（可选）
+                if grad_norms.numel() == 0 or grad_norms.max() == 0:
+                    stats["n_final"] = self.n_gaussians
+                    return stats
+                else:
+                    grad_norms_normalized = grad_norms / (grad_norms.max() + 1e-8)
+
+                split_mask = grad_norms_normalized > grad_threshold
+
+                # 限制分裂数量
+                n_can_split = min(
+                    split_mask.sum().item(),
+                    max_gaussians - self.n_gaussians,
+                )
+
+                if n_can_split > 0:
+                    # 选择梯度最大的 n_can_split 个点
+                    split_indices = torch.topk(
+                        grad_norms * split_mask.float(),
+                        k=n_can_split,
+                    ).indices
+
+                    self._split_gaussians(
+                        split_indices,
+                        split_scale_factor=split_scale_factor,
+                        split_delta_factor=split_delta_factor,
+                    )
+                    stats["n_split"] = n_can_split
+
+            stats["n_final"] = self.n_gaussians
+            return stats
+
+    def _prune_gaussians(self, keep_mask: torch.Tensor):
+        """删除指定的 Gaussians。"""
+        self.centers = nn.Parameter(self.centers[keep_mask])
+        self.log_scales = nn.Parameter(self.log_scales[keep_mask])
+        self.rho_real = nn.Parameter(self.rho_real[keep_mask])
+        self.rho_imag = nn.Parameter(self.rho_imag[keep_mask])
+
+        if self.use_rotation:
+            self.rotations = nn.Parameter(self.rotations[keep_mask])
+        else:
+            self.rotations = self.rotations[keep_mask]
+
+    def _split_gaussians(
+        self,
+        split_indices: torch.Tensor,
+        split_scale_factor: float = 0.7,
+        split_delta_factor: float = 0.5,
+    ):
+        """Long-axis splitting: 沿最大 scale 轴分裂。
+
+        Args:
+            split_indices: 要分裂的 Gaussian 索引
+            split_scale_factor: 分裂后 scale 缩小系数
+            split_delta_factor: 位移系数
+        """
+        n_split = split_indices.shape[0]
+        if n_split == 0:
+            return
+
+        # 获取要分裂的 Gaussians
+        centers_to_split = self.centers[split_indices]      # (n_split, 3)
+        log_scales_to_split = self.log_scales[split_indices]  # (n_split, 3)
+        rho_real_to_split = self.rho_real[split_indices]    # (n_split,)
+        rho_imag_to_split = self.rho_imag[split_indices]    # (n_split,)
+
+        scales_to_split = torch.exp(log_scales_to_split)    # (n_split, 3)
+
+        # 找到最大 scale 的轴
+        max_axis = torch.argmax(scales_to_split, dim=1)  # (n_split,)
+
+        # 计算位移
+        delta = split_delta_factor * scales_to_split[torch.arange(n_split), max_axis]  # (n_split,)
+
+        # 构建方向向量（沿最大轴的单位向量）
+        direction = torch.zeros(n_split, 3, device=self.device)
+        direction[torch.arange(n_split), max_axis] = 1.0
+
+        # 生成两个新的中心
+        new_centers_plus = centers_to_split + delta.unsqueeze(1) * direction
+        new_centers_minus = centers_to_split - delta.unsqueeze(1) * direction
+
+        # 新的 log_scales（缩小）
+        new_log_scales = log_scales_to_split + math.log(split_scale_factor)
+
+        # 新的 rho（平分）
+        new_rho_real = rho_real_to_split / 2
+        new_rho_imag = rho_imag_to_split / 2
+
+        # 合并新旧参数
+        # 保留原有的（除了被分裂的）
+        keep_mask = torch.ones(self.n_gaussians, dtype=torch.bool, device=self.device)
+        keep_mask[split_indices] = False
+
+        new_centers = torch.cat([
+            self.centers[keep_mask],
+            new_centers_plus,
+            new_centers_minus,
+        ], dim=0)
+
+        new_log_scales = torch.cat([
+            self.log_scales[keep_mask],
+            new_log_scales,
+            new_log_scales,
+        ], dim=0)
+
+        new_rho_real = torch.cat([
+            self.rho_real[keep_mask],
+            new_rho_real,
+            new_rho_real,
+        ], dim=0)
+
+        new_rho_imag = torch.cat([
+            self.rho_imag[keep_mask],
+            new_rho_imag,
+            new_rho_imag,
+        ], dim=0)
+
+        # 更新参数
+        self.centers = nn.Parameter(new_centers)
+        self.log_scales = nn.Parameter(new_log_scales)
+        self.rho_real = nn.Parameter(new_rho_real)
+        self.rho_imag = nn.Parameter(new_rho_imag)
+
+        # Rotations
+        if self.use_rotation:
+            rotations_to_split = self.rotations[split_indices]
+            new_rotations = torch.cat([
+                self.rotations[keep_mask],
+                rotations_to_split,
+                rotations_to_split,
+            ], dim=0)
+            self.rotations = nn.Parameter(new_rotations)
+        else:
+            rotations_to_split = self.rotations[split_indices]
+            new_rotations = torch.cat([
+                self.rotations[keep_mask],
+                rotations_to_split,
+                rotations_to_split,
+            ], dim=0)
+            self.rotations = new_rotations
+
+    def get_state_dict(self) -> Dict[str, torch.Tensor]:
+        """获取模型状态用于保存。"""
+        state = {
+            "centers": self.centers.data,
+            "log_scales": self.log_scales.data,
+            "rho_real": self.rho_real.data,
+            "rho_imag": self.rho_imag.data,
+            "rotations": self.rotations.data if self.use_rotation else self.rotations,
+        }
+        return state
+
+    def load_state_dict_custom(self, state: Dict[str, torch.Tensor]):
+        """从保存的状态恢复模型。"""
+        n_gaussians = state["centers"].shape[0]
+
+        self.centers = nn.Parameter(state["centers"].to(self.device))
+        self.log_scales = nn.Parameter(state["log_scales"].to(self.device))
+        self.rho_real = nn.Parameter(state["rho_real"].to(self.device))
+        self.rho_imag = nn.Parameter(state["rho_imag"].to(self.device))
+
+        if self.use_rotation:
+            self.rotations = nn.Parameter(state["rotations"].to(self.device))
+        else:
+            self.rotations = state["rotations"].to(self.device)
 
 
 if __name__ == "__main__":
-    # 测试代码
-    device = 'cuda:1'
-    volume_shape = (64, 64, 64)
-    
-    print("=== Testing ComplexGaussianModel ===")
-    model = ComplexGaussianModel(
-        num_gaussians=1000,
+    # 简单测试
+    print("=== Model Test ===")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    volume_shape = (32, 64, 64)
+
+    # 创建模型
+    model = GaussianMRIModel(
         volume_shape=volume_shape,
-        device=device
+        n_gaussians=100,
+        device=device,
     )
-    print(f"Positions shape: {model.positions.shape}")
-    print(f"Scales shape: {model.scales.shape}")
-    print(f"Complex densities shape: {model.complex_densities.shape}")
-    
-    print("\n=== Testing Voxelizer ===")
-    voxelizer = Voxelizer(volume_shape, device=device)
-    
-    positions, cov_inv, dens_real, dens_imag = model()
-    volume = voxelizer(positions, cov_inv, dens_real, dens_imag)
-    print(f"Output volume shape: {volume.shape}")
-    print(f"Output dtype: {volume.dtype}")
-    print(f"Output range: [{volume.abs().min():.4f}, {volume.abs().max():.4f}]")
+    print(f"Initial Gaussians: {model.n_gaussians}")
+
+    # 创建 mock 初始图像
+    image_init = torch.randn(*volume_shape, dtype=torch.complex64, device=device)
+
+    # 从图像初始化
+    model.initialize_from_image(
+        image_init,
+        n_gaussians=500,
+        percentile_thresh=10.0,
+    )
+    print(f"After init: {model.n_gaussians} Gaussians")
+
+    # 体素化
+    volume = model.voxelize()
+    print(f"Volume shape: {volume.shape}, dtype: {volume.dtype}")
+
+    # Forward
+    mask = torch.ones(*volume_shape, device=device)
+    recon, kspace_pred = model.forward(mask)
+    print(f"Recon shape: {recon.shape}, K-space shape: {kspace_pred.shape}")
+
+    # Loss
+    kspace_target = torch.randn_like(kspace_pred)
+    loss, loss_dict = model.compute_loss(kspace_pred, kspace_target, mask, volume, lambda_tv=0.001)
+    print(f"Loss: {loss.item():.6f}, Dict: {loss_dict}")
+
+    # 反向传播（测试梯度）
+    loss.backward()
+    print(f"Centers grad norm: {model.centers.grad.norm().item():.6f}")
+
+    # Densify/Prune
+    stats = model.densify_and_prune(grad_threshold=0.01, prune_rho_thresh=0.0001)
+    print(f"Densify stats: {stats}")
+
+    print("Model test passed!")

@@ -1,87 +1,84 @@
 #!/bin/bash
-# 3DGSMR Training Script
-# 使用方法: bash train.sh
+# train.sh - 3D Gaussian Splatting MRI Reconstruction Training Script
+# Example run (pt1.10): GPU=1 DATA=/data/data54/wanghaobo/data/ksp_full.h5 OUT=./outputs ITERS=5000 bash train.sh
+#
+# Usage (single GPU):
+#   bash train.sh
+#
+# Usage (multi-GPU):
+#   MULTI_GPU=1 bash train.sh
 
-# ============================================
-# 环境设置
-# ============================================
-echo "============================================"
-echo "3DGSMR Training Script"
-echo "============================================"
+# ============================================================================
+# Configuration - Modify these variables
+# ============================================================================
 
-# 激活 conda 环境
-source /opt/anaconda3/etc/profile.d/conda.sh
-conda activate pt1.10
+# GPU settings
+GPU=${GPU:-0}                          # GPU ID for single-GPU training
+NGPU=${NGPU:-4}                        # Number of GPUs for multi-GPU training
+MULTI_GPU=${MULTI_GPU:-0}              # Set to 1 to enable multi-GPU
 
-# 设置 GPU
-export CUDA_VISIBLE_DEVICES=3
+# Data paths
+DATA=${DATA:-/path/to/data}            # H5 file or directory containing H5 files
+OUT=${OUT:-./outputs}                  # Output directory
 
-# PyTorch 内存管理优化
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+# Training settings
+ITERS=${ITERS:-2000}                   # Maximum optimization iterations
+N_GAUSSIANS=${N_GAUSSIANS:-1000}       # Initial number of Gaussians
 
-# ============================================
-# 配置参数
-# ============================================
+# Data-related hyperparameters
+ACC=${ACC:-4.0}                        # Acceleration factor
+MASK_TYPE=${MASK_TYPE:-gaussian}       # Mask type: gaussian or uniform
+CENTER_FRAC=${CENTER_FRAC:-0.08}       # Center fraction for ACS
 
-# 数据路径
-DATA_PATH="/data/data54/wanghaobo/data/ksp_full.h5"
+# Optional: Additional arguments
+EXTRA_ARGS=${EXTRA_ARGS:-""}           # Any additional arguments
 
-# 欠采样参数
-ACCELERATION=4.0        # 加速倍数: 4x, 8x, 等
-CENTER_FRACTION=0.08    # 中心全采样比例
-MASK_TYPE="gaussian"    # 掩码类型: gaussian, uniform
+# ============================================================================
+# Run Training
+# ============================================================================
 
-# 模型参数
-INIT_NUM_GAUSSIANS=10000
-MAX_GAUSSIANS=100000
+echo "=============================================="
+echo "3DGS MRI Reconstruction - Training"
+echo "=============================================="
+echo "Data: $DATA"
+echo "Output: $OUT"
+echo "Iterations: $ITERS"
+echo "Initial Gaussians: $N_GAUSSIANS"
+echo "Acceleration: ${ACC}x"
+echo "Mask Type: $MASK_TYPE"
+echo "=============================================="
 
-# 训练参数
-NUM_ITERATIONS=5000
-LEARNING_RATE=0.001
-DENSIFY_INTERVAL=100
+if [ "$MULTI_GPU" -eq 1 ]; then
+    echo "Mode: Multi-GPU ($NGPU GPUs)"
+    echo "=============================================="
+    
+    CUDA_VISIBLE_DEVICES=$GPU torchrun \
+        --nproc_per_node=$NGPU \
+        train.py \
+        --data_root "$DATA" \
+        --out_root "$OUT" \
+        --max_iters $ITERS \
+        --n_gaussians $N_GAUSSIANS \
+        --acceleration $ACC \
+        --mask_type $MASK_TYPE \
+        --center_fraction $CENTER_FRAC \
+        --distributed 1 \
+        $EXTRA_ARGS
+else
+    echo "Mode: Single-GPU (GPU $GPU)"
+    echo "=============================================="
+    
+    CUDA_VISIBLE_DEVICES=$GPU python train.py \
+        --data_root "$DATA" \
+        --out_root "$OUT" \
+        --max_iters $ITERS \
+        --n_gaussians $N_GAUSSIANS \
+        --acceleration $ACC \
+        --mask_type $MASK_TYPE \
+        --center_fraction $CENTER_FRAC \
+        $EXTRA_ARGS
+fi
 
-# 日志参数
-LOG_INTERVAL=100
-SAVE_INTERVAL=1000
-SAVE_DIR="checkpoints/3dgsmr_acc${ACCELERATION}_$(date +%Y%m%d_%H%M%S)"
-
-# 设备
-DEVICE="cuda:0"  # 因为 CUDA_VISIBLE_DEVICES=3，所以这里用 cuda:0
-SEED=42
-
-# ============================================
-# 运行训练
-# ============================================
 echo ""
-echo "Configuration:"
-echo "  Data Path: ${DATA_PATH}"
-echo "  Acceleration: ${ACCELERATION}x"
-echo "  Mask Type: ${MASK_TYPE}"
-echo "  Num Iterations: ${NUM_ITERATIONS}"
-echo "  Save Dir: ${SAVE_DIR}"
-echo "  Device: GPU 3 (${DEVICE})"
-echo ""
-
-cd /data/data54/wanghaobo/3DGS
-
-python train.py \
-    --data_path "${DATA_PATH}" \
-    --acceleration ${ACCELERATION} \
-    --center_fraction ${CENTER_FRACTION} \
-    --mask_type "${MASK_TYPE}" \
-    --init_num_gaussians ${INIT_NUM_GAUSSIANS} \
-    --max_gaussians ${MAX_GAUSSIANS} \
-    --num_iterations ${NUM_ITERATIONS} \
-    --learning_rate ${LEARNING_RATE} \
-    --densify_interval ${DENSIFY_INTERVAL} \
-    --log_interval ${LOG_INTERVAL} \
-    --save_interval ${SAVE_INTERVAL} \
-    --save_dir "${SAVE_DIR}" \
-    --device "${DEVICE}" \
-    --seed ${SEED}
-
-echo ""
-echo "============================================"
-echo "Training completed!"
-echo "Checkpoints saved to: ${SAVE_DIR}"
-echo "============================================"
+echo "Training complete!"
+echo "Results saved to: $OUT"

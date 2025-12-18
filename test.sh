@@ -1,83 +1,77 @@
 #!/bin/bash
-# 3DGSMR Testing Script
-# 使用方法: bash test.sh <checkpoint_path>
-# 示例: bash test.sh checkpoints/3dgsmr_acc4.0_20241210/checkpoint_final.pth
+# test.sh - 3D Gaussian Splatting MRI Reconstruction Test/Evaluation Script
+#
+# Usage (single GPU):
+#   bash test.sh
+#
+# Usage (multi-GPU):
+#   MULTI_GPU=1 bash test.sh
 
-# ============================================
-# 环境设置
-# ============================================
-echo "============================================"
-echo "3DGSMR Testing Script"
-echo "============================================"
+# ============================================================================
+# Configuration - Modify these variables
+# ============================================================================
 
-# 激活 conda 环境
-source /opt/anaconda3/etc/profile.d/conda.sh
-conda activate pt1.10
+# GPU settings
+GPU=${GPU:-0}                          # GPU ID for single-GPU testing
+NGPU=${NGPU:-2}                        # Number of GPUs for multi-GPU testing
+MULTI_GPU=${MULTI_GPU:-0}              # Set to 1 to enable multi-GPU
 
-# 设置 GPU
-export CUDA_VISIBLE_DEVICES=3
+# Paths
+DATA=${DATA:-""}                       # H5 file or directory (optional, for GT comparison)
+OUT=${OUT:-./outputs}                  # Output directory containing results
 
-# PyTorch 内存管理优化
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+# Data-related hyperparameters (only used if DATA is provided)
+ACC=${ACC:-4.0}                        # Acceleration factor
+MASK_TYPE=${MASK_TYPE:-gaussian}       # Mask type: gaussian or uniform
 
-# ============================================
-# 参数检查
-# ============================================
-if [ -z "$1" ]; then
-    echo "Usage: bash test.sh <checkpoint_path>"
-    echo "Example: bash test.sh checkpoints/3dgsmr_acc4.0_20241210/checkpoint_final.pth"
+# Output
+OUTPUT_FILE=${OUTPUT_FILE:-results.json}
+
+# Optional: Additional arguments
+EXTRA_ARGS=${EXTRA_ARGS:-""}
+
+# ============================================================================
+# Run Evaluation
+# ============================================================================
+
+echo "=============================================="
+echo "3DGS MRI Reconstruction - Evaluation"
+echo "=============================================="
+echo "Results directory: $OUT"
+if [ -n "$DATA" ]; then
+    echo "Data (for GT): $DATA"
+    echo "Acceleration: ${ACC}x"
+    echo "Mask Type: $MASK_TYPE"
+fi
+echo "Output file: $OUTPUT_FILE"
+echo "=============================================="
+
+# Build command
+CMD="--out_root \"$OUT\" --output_file $OUTPUT_FILE"
+
+if [ -n "$DATA" ]; then
+    CMD="$CMD --data_root \"$DATA\" --acceleration $ACC --mask_type $MASK_TYPE"
+fi
+
+if [ "$MULTI_GPU" -eq 1 ]; then
+    echo "Mode: Multi-GPU ($NGPU GPUs)"
+    echo "=============================================="
     
-    # 如果没有提供参数，尝试找到最新的 checkpoint
-    LATEST_CKPT=$(find checkpoints -name "checkpoint_final.pth" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
-    
-    if [ -n "$LATEST_CKPT" ]; then
-        echo ""
-        echo "Found latest checkpoint: ${LATEST_CKPT}"
-        echo "Using this checkpoint..."
-        CHECKPOINT="${LATEST_CKPT}"
-    else
-        echo "No checkpoint found. Please train the model first."
-        exit 1
-    fi
+    eval "CUDA_VISIBLE_DEVICES=$GPU torchrun \
+        --nproc_per_node=$NGPU \
+        test.py \
+        $CMD \
+        --distributed 1 \
+        $EXTRA_ARGS"
 else
-    CHECKPOINT="$1"
+    echo "Mode: Single-GPU (GPU $GPU)"
+    echo "=============================================="
+    
+    eval "CUDA_VISIBLE_DEVICES=$GPU python test.py \
+        $CMD \
+        $EXTRA_ARGS"
 fi
 
-# 检查 checkpoint 是否存在
-if [ ! -f "${CHECKPOINT}" ]; then
-    echo "Error: Checkpoint file not found: ${CHECKPOINT}"
-    exit 1
-fi
-
-# ============================================
-# 配置参数
-# ============================================
-SAVE_DIR="results/$(basename $(dirname ${CHECKPOINT}))_$(date +%Y%m%d_%H%M%S)"
-DEVICE="cuda:0"  # 因为 CUDA_VISIBLE_DEVICES=1，所以这里用 cuda:0
-VISUALIZE="--visualize"
-NUM_SLICES=5
-
-# ============================================
-# 运行测试
-# ============================================
 echo ""
-echo "Configuration:"
-echo "  Checkpoint: ${CHECKPOINT}"
-echo "  Save Dir: ${SAVE_DIR}"
-echo "  Device: GPU 1 (${DEVICE})"
-echo ""
-
-cd /data/data54/wanghaobo/3DGS
-
-python test.py \
-    --checkpoint "${CHECKPOINT}" \
-    --save_dir "${SAVE_DIR}" \
-    --device "${DEVICE}" \
-    ${VISUALIZE} \
-    --num_slices ${NUM_SLICES}
-
-echo ""
-echo "============================================"
-echo "Testing completed!"
-echo "Results saved to: ${SAVE_DIR}"
-echo "============================================"
+echo "Evaluation complete!"
+echo "Results saved to: $OUT/$OUTPUT_FILE"
