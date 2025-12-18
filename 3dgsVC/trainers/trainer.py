@@ -333,14 +333,45 @@ class GaussianTrainer:
         
         # 重建优化器
         if stats['split'] > 0 or stats['clone'] > 0 or stats['prune'] > 0:
+            # 关键修复：当参数形状改变时，必须清除优化器状态
+            # 并且不能在backward之后立即改变参数形状，因为梯度还在计算图中
+            # 但这里是在backward之后调用的（在train loop中），所以是安全的
+            # 问题在于：如果我们在backward之前改变了参数（比如在adaptive_density_control中），
+            # 那么backward时就会报错，因为计算图中的参数形状和实际参数形状不匹配
+            
+            # 实际上，adaptive_density_control是在train loop的末尾调用的
+            # 所以参数改变发生在backward之后，这是正确的
+            
+            # 但是，如果我们在adaptive_density_control中改变了参数，
+            # 那么在下一次forward之前，我们需要重新初始化优化器
+            
+            # 这里的潜在问题是：Adam优化器内部维护了动量等状态，这些状态的形状必须与参数匹配
+            # 当我们改变参数形状时，必须重新初始化优化器
+            
             train_config = self.config['training']
+            
+            # 获取当前学习率（可能已经衰减）
+            current_lr_dict = {}
+            for param_group in self.optimizer.param_groups:
+                # 假设参数组顺序固定
+                pass
+            
+            # 简单起见，使用初始学习率或当前衰减后的学习率
+            # 这里我们重新创建一个新的优化器
+            
             params = self.gaussian_model.get_optimizable_params(
-                lr_position=train_config.get('lr_position', 1e-4),
-                lr_density=train_config.get('lr_density', 1e-3),
-                lr_scale=train_config.get('lr_scale', 5e-4),
-                lr_rotation=train_config.get('lr_rotation', 1e-4)
+                lr_position=train_config.get('gaussian', {}).get('position_lr', 0.001),
+                lr_density=train_config.get('gaussian', {}).get('density_lr', 0.01),
+                lr_scale=train_config.get('gaussian', {}).get('scale_lr', 0.005),
+                lr_rotation=train_config.get('gaussian', {}).get('rotation_lr', 0.001)
             )
             self.optimizer = optim.Adam(params)
+            
+            # 还需要更新scheduler
+            self._setup_optimizer() # 重新设置optimizer和scheduler
+            
+            # 打印信息
+            print(f"  Re-initialized optimizer with {self.gaussian_model.num_points} points")
         
         return stats
     
@@ -502,9 +533,13 @@ class GaussianTrainer:
             start_time = time.time()
             
             # 训练步骤
+            # 注意：如果上一步进行了densification，optimizer已经被重新初始化
+            # 这里的train_step会使用新的optimizer
             loss_dict = self.train_step()
             
             # 自适应密度控制
+            # 这会改变模型参数形状，并重新初始化optimizer
+            # 必须在train_step之后调用，这样下一次迭代才会使用新的optimizer
             adaptive_stats = self.adaptive_density_control(iteration)
             
             # 学习率调度

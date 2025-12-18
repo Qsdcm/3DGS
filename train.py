@@ -101,11 +101,12 @@ def main(args: argparse.Namespace) -> None:
         max_add_per_interval=args.max_add_per_interval,
     )
 
+    # 找到这段代码 (大约 123行)
     model = GaussianMRIModel.from_initial_volume(
         aliased,
-        num_points=args.num_gaussians,
+        num_points=args.num_gaussians, # 确保这里的 args.num_gaussians 是 500
         magnitude_quantile=args.mag_quantile,
-        scale_voxels=tuple(args.scale_voxels),
+        # scale_voxels=tuple(args.scale_voxels),  <-- 删除这一行，因为现在是自动计算的
         max_points=args.max_gaussians,
         adaptive=adaptive_cfg,
         seed=args.seed,

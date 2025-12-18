@@ -9,7 +9,7 @@ adaptive_control:
   use_cloning: false
   use_long_axis_splitting: true
 data:
-  acceleration_factor: 2
+  acceleration_factor: 4
   acs_lines: 32
   data_path: /data/data54/wanghaobo/data/ksp_full.h5
   mask_type: gaussian
@@ -24,13 +24,13 @@ gaussian:
   rotation_lr: 0.001
   scale_lr: 0.005
 hardware:
-  device: cuda:3
+  device: cuda:2
   num_workers: 16
   use_amp: false
 loss:
   image_weight: 0.1
   kspace_weight: 1.0
-  loss_type: l1
+  loss_type: l2
   tv_weight: 0.0
 output:
   exp_name: 3dgsmr_exp

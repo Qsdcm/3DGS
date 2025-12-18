@@ -7,7 +7,7 @@
 data:
   data_path: "/data/data54/wanghaobo/data/ksp_full.h5"
   # 加速因子 (2, 3, 4, 6, 8)
-  acceleration_factor: 2
+  acceleration_factor: 4
   # 欠采样mask类型: "gaussian", "poisson", "random"
   mask_type: "gaussian"
   # 是否使用ACS (Auto-Calibration Signal) 区域
@@ -81,7 +81,7 @@ loss:
   # TV正则化权重 (论文中发现对MRI影响有限,可设为0)
   tv_weight: 0.0
   # L1 vs L2 loss
-  loss_type: "l1"  # "l1" or "l2"
+  loss_type: "l2"  # "l1" or "l2"
 
 # Output Configuration
 output:
@@ -99,7 +99,7 @@ output:
 # Hardware Configuration
 hardware:
   # GPU设备ID
-  device: "cuda:3"
+  device: "cuda:2"
   # 混合精度训练
   use_amp: false  # MRI复值计算时需谨慎使用
   # 数据加载线程数
