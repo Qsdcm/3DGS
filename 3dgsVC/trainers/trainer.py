@@ -2,7 +2,7 @@
 3DGSMR Trainer (Final Revised Version)
 
 完全对齐论文:
-1. Loss使用Sum reduction (配合losses.py修改) -> 梯度量级正常
+1. Loss使用 Sum reduction (配合losses.py修改) -> 梯度量级正常
 2. 传递极小的 scale_threshold (0.0005) -> 允许细微结构分裂
 3. Densification频率=100iter, 持续到2500iter -> 确保长到400k点
 """

@@ -4,7 +4,7 @@ Loss Functions for 3DGSMR (Revised)
 Correction:
 论文 Fig 5 显示 Loss 值在 10^5 - 10^6 量级，且 Table 1 使用 grad_threshold=0.02。
 这意味着 Loss 必须是 Sum Reduction (求和) 而非 Mean Reduction (平均)。
-使用 Mean 会导致梯度被除以像素数 (N~4e6)，使得梯度远小于 0.02，导致无法分裂。
+使用 Mean 会导致梯度被除以像素数 (N~4e6)，使得梯度远小于 0.02,导致无法分裂。
 """
 
 import torch

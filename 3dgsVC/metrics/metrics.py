@@ -3,7 +3,7 @@ Evaluation Metrics for MRI Reconstruction
 
 评估指标:
 - PSNR (Peak Signal-to-Noise Ratio)
-- SSIM (Structural Similarity Index)
+- SSIM (Structural Similarity Index) 
 - NMSE (Normalized Mean Squared Error)
 """
 
