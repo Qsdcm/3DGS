@@ -5,7 +5,7 @@
 1. 加载训练好的模型 (支持指定权重)
 2. 执行重建 (支持指定加速倍数)
 3. 自动保存三组数据: 原图(GT), 欠采样(ZF), 重建(Recon)
-4. 生成对比切片图像
+4. 生成对比切片图像 (Added Mask Visualization)
 5. 自动根据加速倍数生成输出文件夹
 """
 
@@ -92,6 +92,7 @@ class GaussianTester:
         self.volume_shape = data['volume_shape']
         self.target_image = data['ground_truth'].to(self.device) # 原图
         self.zero_filled = data['zero_filled'].to(self.device)   # 欠采样(零填充)
+        self.mask = data['mask'].to(self.device)                 # K-space Mask (Added)
         
     def _setup_model(self, checkpoint: Dict):
         gaussian_state = checkpoint['gaussian_state']
@@ -149,6 +150,7 @@ class GaussianTester:
         recon_np = recon_volume.detach().cpu().numpy()
         target_np = self.target_image.detach().cpu().numpy()
         zf_np = self.zero_filled.detach().cpu().numpy()
+        mask_np = self.mask.detach().cpu().numpy() # Mask (Real)
         
         if save_volume:
             print(f"\nSaving volumes to {output_dir} ...")
@@ -166,14 +168,14 @@ class GaussianTester:
         
         if save_slices:
             print("Generating comparison slices...")
-            self._save_comparison_slices(target_np, zf_np, recon_np, output_dir)
+            self._save_comparison_slices(target_np, zf_np, recon_np, mask_np, output_dir)
             
     def _save_nifti(self, volume_abs, path):
         img = nib.Nifti1Image(volume_abs, np.eye(4))
         nib.save(img, path)
 
-    def _save_comparison_slices(self, target, zf, recon, output_dir):
-        """生成三图对比切片: GT | Zero-Filled | Recon"""
+    def _save_comparison_slices(self, target, zf, recon, mask, output_dir):
+        """生成四图对比切片: GT | Zero-Filled | Recon | Mask"""
         try:
             import matplotlib
             matplotlib.use('Agg')
@@ -187,6 +189,7 @@ class GaussianTester:
         t_mag = np.abs(target)
         z_mag = np.abs(zf)
         r_mag = np.abs(recon)
+        m_mag = np.abs(mask) # Mask is usually binary 0/1, abs is safe
         
         vmax = np.percentile(t_mag, 99.9)
         D, H, W = t_mag.shape
@@ -200,17 +203,18 @@ class GaussianTester:
         for view_name, (dim, idxs) in slices_map.items():
             for idx in idxs:
                 if dim == 0:
-                    imgs = [t_mag[idx,:,:], z_mag[idx,:,:], r_mag[idx,:,:]]
+                    imgs = [t_mag[idx,:,:], z_mag[idx,:,:], r_mag[idx,:,:], m_mag[idx,:,:]]
                 elif dim == 1:
-                    imgs = [t_mag[:,idx,:], z_mag[:,idx,:], r_mag[:,idx,:]]
+                    imgs = [t_mag[:,idx,:], z_mag[:,idx,:], r_mag[:,idx,:], m_mag[:,idx,:]]
                 else:
-                    imgs = [t_mag[:,:,idx], z_mag[:,:,idx], r_mag[:,:,idx]]
+                    imgs = [t_mag[:,:,idx], z_mag[:,:,idx], r_mag[:,:,idx], m_mag[:,:,idx]]
                 
-                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-                titles = ['Original (GT)', 'Undersampled (ZF)', 'Reconstruction']
+                # 修改为 1行4列
+                fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+                titles = ['Original (GT)', 'Undersampled (ZF)', 'Reconstruction', 'K-Space Mask']
                 
                 for ax, img, title in zip(axes, imgs, titles):
-                    ax.imshow(img, cmap='gray', vmin=0, vmax=vmax)
+                    ax.imshow(img, cmap='gray', vmin=0, vmax=vmax if title != 'K-Space Mask' else 1.0)
                     ax.set_title(title)
                     ax.axis('off')
                 
@@ -223,14 +227,9 @@ class GaussianTester:
 def main():
     args = parse_args()
     
-    # --- 修改部分：路径构建逻辑 ---
-    # 1. 路径
+    # 路径构建逻辑
     base_project_path = "/data/data54/wanghaobo/3DGS/3dgsVC"
-    
-    # 2. 处理加速倍数显示 (2.0 -> 2, 2.5 -> 2.5)
     acc_tag = int(args.acceleration) if args.acceleration.is_integer() else args.acceleration
-    
-    # 3. 自动生成输出文件夹名
     output_folder_name = f"test_results_{acc_tag}x"
     save_dir = os.path.join(base_project_path, output_folder_name)
     
@@ -255,13 +254,13 @@ def main():
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
             
-    # 初始化 Tester (传入新的 dataset 和 acceleration 参数)
+    # 初始化 Tester
     tester = GaussianTester(
-        checkpoint_path=args.weights,  # 使用 weights 参数
+        checkpoint_path=args.weights,
         config=config, 
         device=device, 
-        data_path=args.dataset,        # 使用 dataset 参数
-        acceleration_override=args.acceleration # 传入加速倍数
+        data_path=args.dataset,
+        acceleration_override=args.acceleration
     )
     
     # 执行保存

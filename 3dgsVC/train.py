@@ -18,6 +18,8 @@ import numpy as np
 import random
 
 from trainers import GaussianTrainer
+# Import Tester
+from test import GaussianTester
 
 
 def parse_args():
@@ -174,6 +176,32 @@ def main():
     print(f"Best SSIM: {best_ssim:.4f}")
     print(f"Results saved to: {config['output']['output_dir']}")
     print("=" * 50)
+
+    # --- Automatic Testing ---
+    print("\n" + "=" * 50)
+    print("Starting Automatic Testing (Best Checkpoint)")
+    print("=" * 50)
+    
+    # 构建测试路径和参数
+    best_checkpoint_path = os.path.join(config['output']['output_dir'], 'checkpoints', 'best.pth')
+    
+    # 使用配置中的加速因子
+    acc = config['data']['acceleration_factor']
+    
+    # 测试结果输出到 output_dir/test_results_best
+    test_output_dir = os.path.join(config['output']['output_dir'], 'test_results_best')
+    
+    if os.path.exists(best_checkpoint_path):
+        tester = GaussianTester(
+            checkpoint_path=best_checkpoint_path,
+            config=config, # 传递当前的config
+            device=device,
+            data_path=config['data']['data_path'],
+            acceleration_override=acc
+        )
+        tester.save_results(output_dir=test_output_dir, save_volume=True, save_slices=True)
+    else:
+        print(f"Error: Best checkpoint not found at {best_checkpoint_path}")
 
 
 if __name__ == '__main__':

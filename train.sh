@@ -1,1 +1,5 @@
-bash scripts/train.sh --acceleration 8 --gpu 2 --max_iterations 3000 --initial_points 500
+bash scripts/train.sh \
+    --acceleration 6 \
+    --gpu 4 \
+    --max_iterations 2000 \
+    --initial_points 50000

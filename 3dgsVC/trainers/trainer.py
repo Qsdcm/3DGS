@@ -5,6 +5,7 @@
 1. Loss使用 Sum reduction (配合losses.py修改) -> 梯度量级正常
 2. 传递极小的 scale_threshold (0.0005) -> 允许细微结构分裂
 3. Densification频率=100iter, 持续到2500iter -> 确保长到400k点
+4. Added TensorBoard support
 """
 
 import os
@@ -14,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ExponentialLR, CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter # Added
 import numpy as np
 from typing import Dict, Optional, Tuple, Any
 from tqdm import tqdm
@@ -143,6 +145,14 @@ class GaussianTrainer:
         config_path = os.path.join(self.output_dir, 'config.yaml')
         with open(config_path, 'w') as f:
             yaml.dump(self.config, f, default_flow_style=False)
+            
+        # --- TensorBoard Setup ---
+        if output_config.get('use_tensorboard', True):
+            log_dir = os.path.join(self.output_dir, 'logs')
+            self.writer = SummaryWriter(log_dir=log_dir)
+            print(f"TensorBoard logging to: {log_dir}")
+        else:
+            self.writer = None
             
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = self.gaussian_model.positions
@@ -397,7 +407,7 @@ class GaussianTrainer:
             adaptive_stats = self.adaptive_density_control(iteration)
             self.scheduler.step()
             
-            # 增强的Log信息
+            # 增强的Log信息 & TensorBoard logging
             if iteration % log_every == 0:
                 grad_stats = self.compute_gradient_stats()
                 mean_grad = grad_stats.get('mean_grad', 0.0)
@@ -409,6 +419,17 @@ class GaussianTrainer:
                     'grad': f"{mean_grad:.2e}",             # 监控梯度是否 > 0.0002
                     'n_pts': self.gaussian_model.num_points
                 })
+                
+                # TensorBoard Logging
+                if self.writer:
+                    self.writer.add_scalar('Loss/total', loss_dict['total_loss'], iteration)
+                    if 'kspace_loss' in loss_dict:
+                        self.writer.add_scalar('Loss/kspace', loss_dict['kspace_loss'], iteration)
+                    if 'image_loss' in loss_dict:
+                        self.writer.add_scalar('Loss/image', loss_dict['image_loss'], iteration)
+                    
+                    self.writer.add_scalar('Stats/num_points', self.gaussian_model.num_points, iteration)
+                    self.writer.add_scalar('Stats/mean_grad', mean_grad, iteration)
             
             if iteration % eval_every == 0 or iteration == max_iterations - 1:
                 metrics = self.evaluate()
@@ -419,6 +440,11 @@ class GaussianTrainer:
                 
                 print(f"\n[Iter {iteration}] PSNR: {metrics['psnr']:.2f} dB, SSIM: {metrics['ssim']:.4f}")
                 
+                # TensorBoard Metrics
+                if self.writer:
+                    self.writer.add_scalar('Metrics/PSNR', metrics['psnr'], iteration)
+                    self.writer.add_scalar('Metrics/SSIM', metrics['ssim'], iteration)
+                
                 # 打印分裂详情
                 if adaptive_stats['split'] > 0 or adaptive_stats['clone'] > 0 or adaptive_stats['prune'] > 0:
                     print(f"  Density: split={adaptive_stats['split']}, clone={adaptive_stats['clone']}, prune={adaptive_stats['prune']}")
@@ -427,6 +453,10 @@ class GaussianTrainer:
                 
                 self.save_checkpoint(iteration, is_best)
         
+        # Close writer
+        if self.writer:
+            self.writer.close()
+
         print("\n" + "=" * 50)
         print("Training completed!")
         print(f"Best PSNR: {self.best_psnr:.2f} dB")

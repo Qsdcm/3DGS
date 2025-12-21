@@ -36,18 +36,18 @@ adaptive_control:
   # 梯度阈值 (论文 Table 1: s=0.02)
   # 注意: 如果Loss是Sum reduction，梯度会很大，这里0.0002会触发所有点分裂
   # 我们依靠 scale_threshold 来控制停止
-  grad_threshold: 0.0002
+  grad_threshold: 0.02
   
   use_long_axis_splitting: true
   # 关键修改: 大幅降低尺度阈值，允许分裂到非常细微 (0.0005 约为 0.05 个体素大小)
-  scale_threshold: 0.0005
+  scale_threshold: 0.00025
   
   use_cloning: false
   opacity_threshold: 0.01
 
 # Training Configuration
 training:
-  max_iterations: 3000
+  max_iterations: 2000
   save_every: 500
   log_every: 50
   eval_every: 100
@@ -62,8 +62,8 @@ training:
 # Loss Configuration
 loss:
   kspace_weight: 1.0
-  image_weight: 0.1
-  tv_weight: 0.0
+  image_weight: 0.0
+  tv_weight: 0.01
   # 必须配合 losses.py 中的 .sum() 使用
   loss_type: "l2"
 
