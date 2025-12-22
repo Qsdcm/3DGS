@@ -10,6 +10,7 @@
 """
 
 import os
+import random
 import argparse
 import yaml
 import torch
@@ -27,6 +28,15 @@ except ImportError:
 from data import MRIDataset
 from gaussian import GaussianModel3D, Voxelizer
 from metrics import evaluate_reconstruction, print_metrics
+
+def set_seed(seed: int):
+    """设置随机种子 (复制自 train.py)"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Test 3DGSMR for MRI Reconstruction')
@@ -221,6 +231,8 @@ class GaussianTester:
         print(f"Saved slice comparisons to {slice_dir}")
 
 def main():
+    set_seed(42)  
+    print(f"Random Seed set to: 42 (Synced with Training)")
     args = parse_args()
     
     # --- 修改部分：路径构建逻辑 ---
