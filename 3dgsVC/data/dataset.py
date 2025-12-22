@@ -162,8 +162,11 @@ class MRIDataset(Dataset):
         cy, cz = ky // 2, kz // 2
         half_acs = self.acs_lines // 2
         
+        # 修复：mask可能是expand生成的视图，必须clone后才能进行in-place修改
+        # 如果不clone，会报 "more than one element... refers to a single memory location"
+        mask = mask.clone()
+        
         # 只在 ky-kz 平面中心添加，贯穿所有 kx
-        # 注意: mask是共享内存的，直接修改会生效
         mask[:, cy-half_acs:cy+half_acs, cz-half_acs:cz+half_acs] = 1.0
         
         return mask
