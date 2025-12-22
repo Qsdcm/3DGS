@@ -237,7 +237,7 @@ def main():
     
     # --- 修改部分：路径构建逻辑 ---
     # 1. 路径
-    base_project_path = "/data/data54/wanghaobo/3DGS/3dgsVC"
+    base_project_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
     
     # 2. 处理加速倍数显示 (2.0 -> 2, 2.5 -> 2.5)
     acc_tag = int(args.acceleration) if args.acceleration.is_integer() else args.acceleration
