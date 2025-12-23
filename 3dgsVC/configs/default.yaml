@@ -6,7 +6,6 @@
 # Data Configuration
 data:
   data_path: "/data/data54/wanghaobo/data/ksp_full.h5"
-  # 加速因子 (2, 3, 4, 6, 8)
   acceleration_factor: 4
   mask_type: "gaussian"
   use_acs: true
@@ -14,9 +13,7 @@ data:
 
 # Gaussian Model Configuration
 gaussian:
-  # 初始Gaussian点数 (论文: High acceleration factors use 500)
   initial_num_points: 500
-  # 最大Gaussian点数 (论文 Page 4: "set to 400 thousand")
   max_num_points: 400000
   initial_scale: 2.0
   position_lr: 0.001
@@ -29,19 +26,11 @@ gaussian:
 adaptive_control:
   enable: true
   densify_from_iter: 100
-  # 论文 Page 4: "densification is done in every 100 iterations"
   densify_every: 100
-  # 延长分裂时间以达到400k点
   densify_until_iter: 2500
-  # 梯度阈值 (论文 Table 1: s=0.02)
-  # 注意: 如果Loss是Sum reduction，梯度会很大，这里0.0002会触发所有点分裂
-  # 我们依靠 scale_threshold 来控制停止
-  grad_threshold: 0.0002
-  
+  grad_threshold: 0.005
   use_long_axis_splitting: true
-  # 关键修改: 大幅降低尺度阈值，允许分裂到非常细微 (0.0005 约为 0.05 个体素大小)
   scale_threshold: 0.0005
-  
   use_cloning: false
   opacity_threshold: 0.01
 
@@ -56,15 +45,13 @@ training:
     gamma: 0.95
     step_size: 200
   seed: 42
-  # 梯度裁剪 (防止分裂初期梯度爆炸)
   max_grad_norm: 1.0
 
 # Loss Configuration
 loss:
   kspace_weight: 1.0
-  image_weight: 0.1
+  image_weight: 0.0
   tv_weight: 0.0
-  # 必须配合 losses.py 中的 .sum() 使用
   loss_type: "l2"
 
 # Output Configuration
@@ -75,8 +62,16 @@ output:
   save_npy: true
   use_tensorboard: true
 
+# Test Configuration (New Added)
+test:
+  # 默认切片索引 (如果没有在命令行指定)
+  slices:
+    axial: [57, 85, 114]     # D dim
+    coronal: [45, 68, 90]    # H dim
+    sagittal: [52, 78, 104]  # W dim
+
 # Hardware Configuration
 hardware:
-  device: "cuda:2"
+  device: "cuda:0"
   use_amp: false
   num_workers: 16

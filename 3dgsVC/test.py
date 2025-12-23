@@ -2,23 +2,21 @@
 3DGSMR Testing/Inference Entry Point (Enhanced)
 
 功能:
-1. 加载训练好的模型 (支持指定权重)
-2. 执行重建 (支持指定加速倍数)
-3. 自动保存三组数据: 原图(GT), 欠采样(ZF), 重建(Recon)
-4. 生成对比切片图像
-5. 自动根据加速倍数生成输出文件夹
+1. 加载训练好的模型
+2. 执行重建
+3. 自动保存: 原图(GT), 欠采样(ZF), 重建(Recon), Mask
+4. 生成对比切片图像 (支持自定义切片位置)
 """
 
 import os
-import random
 import argparse
 import yaml
 import torch
 import numpy as np
 import time
-from typing import Dict, Any
+import random
+from typing import Dict, Any, List
 
-# 尝试导入 nibabel 用于保存 .nii 文件
 try:
     import nibabel as nib
     HAS_NIBABEL = True
@@ -27,32 +25,36 @@ except ImportError:
 
 from data import MRIDataset
 from gaussian import GaussianModel3D, Voxelizer
-from metrics import evaluate_reconstruction, print_metrics
+from metrics import evaluate_reconstruction
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Test 3DGSMR for MRI Reconstruction')
+    
+    parser.add_argument('--dataset', type=str, required=True, help='Path to the dataset')
+    parser.add_argument('--weights', type=str, required=True, help='Path to checkpoint file')
+    parser.add_argument('--acceleration', type=float, default=1.0, help='Acceleration factor')
+    
+    parser.add_argument('--config', type=str, default=None, help='Path to config file')
+    parser.add_argument('--gpu', type=int, default=0, help='GPU device ID')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for mask generation')
+    
+    parser.add_argument('--save_volume', action='store_true', default=True, help='Save volumes as .npy/.nii')
+    parser.add_argument('--save_slices', action='store_true', default=True, help='Save slice comparison images')
+    
+    # 新增: 自定义切片索引参数
+    parser.add_argument('--slices_axial', nargs='+', type=int, help='Slice indices for Axial view (e.g. 50 100 150)')
+    parser.add_argument('--slices_coronal', nargs='+', type=int, help='Slice indices for Coronal view')
+    parser.add_argument('--slices_sagittal', nargs='+', type=int, help='Slice indices for Sagittal view')
+    
+    return parser.parse_args()
 
 def set_seed(seed: int):
-    """设置随机种子 (复制自 train.py)"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Test 3DGSMR for MRI Reconstruction')
-    
-    # --- 修改部分：根据需求调整了参数 ---
-    parser.add_argument('--dataset', type=str, required=True, help='Path to the dataset (e.g., /data/datasets/brain)')
-    parser.add_argument('--weights', type=str, required=True, help='Path to checkpoint/weights file (.pt/.pth)')
-    parser.add_argument('--acceleration', type=float, default=1.0, help='Acceleration factor (e.g., 4, 8)')
-    
-    # 其他可选参数
-    parser.add_argument('--config', type=str, default=None, help='Path to config file (optional)')
-    parser.add_argument('--gpu', type=int, default=0, help='GPU device ID')
-    parser.add_argument('--save_volume', action='store_true', default=True, help='Save volumes as .npy/.nii')
-    parser.add_argument('--save_slices', action='store_true', default=True, help='Save slice comparison images')
-    
-    return parser.parse_args()
 
 class GaussianTester:
     def __init__(self, checkpoint_path: str, config: Dict[str, Any] = None, device: torch.device = None, 
@@ -64,27 +66,21 @@ class GaussianTester:
         print(f"Loading weights from: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
-        # 处理 Config
         if config is not None:
             self.config = config
         elif 'config' in checkpoint:
             self.config = checkpoint['config']
         else:
-            raise ValueError("Config not found in checkpoint and not provided as argument.")
+            raise ValueError("Config not found.")
         
-        # 如果命令行指定了 dataset 路径，覆盖 config
         if data_path is not None:
             self.config['data']['data_path'] = data_path
         
         self._setup_data()
         self._setup_model(checkpoint)
         
-        print(f"Loaded model with {self.gaussian_model.num_points} Gaussians")
-        
     def _setup_data(self):
         data_config = self.config['data']
-        
-        # --- 修改部分：优先使用命令行传入的加速倍数 ---
         acc_factor = self.acceleration_override if self.acceleration_override is not None else data_config['acceleration_factor']
         
         print(f"Loading data from: {data_config['data_path']}")
@@ -92,7 +88,7 @@ class GaussianTester:
         
         self.dataset = MRIDataset(
             data_path=data_config['data_path'],
-            acceleration_factor=acc_factor,  # 使用覆盖后的倍数
+            acceleration_factor=acc_factor,
             mask_type=data_config.get('mask_type', 'gaussian'),
             use_acs=data_config.get('use_acs', True),
             acs_lines=int(data_config.get('center_fraction', 0.08) * 256)
@@ -100,8 +96,10 @@ class GaussianTester:
         
         data = self.dataset.get_data()
         self.volume_shape = data['volume_shape']
-        self.target_image = data['ground_truth'].to(self.device) # 原图
-        self.zero_filled = data['zero_filled'].to(self.device)   # 欠采样(零填充)
+        self.target_image = data['ground_truth'].to(self.device)
+        self.zero_filled = data['zero_filled'].to(self.device)
+        # 保存 Mask 用于可视化
+        self.mask = data['mask'].to(self.device)
         
     def _setup_model(self, checkpoint: Dict):
         gaussian_state = checkpoint['gaussian_state']
@@ -114,7 +112,6 @@ class GaussianTester:
         )
         self.gaussian_model.load_state_dict(checkpoint['gaussian_state'])
         
-        # 使用最新的 Voxelizer
         self.voxelizer = Voxelizer(
             volume_shape=tuple(self.volume_shape),
             device=str(self.device)
@@ -133,57 +130,52 @@ class GaussianTester:
             print(f"Reconstruction took {time.time()-t0:.2f}s")
         return volume
     
-    def save_results(self, output_dir: str, save_volume: bool = True, save_slices: bool = True):
+    def save_results(self, output_dir: str, save_volume: bool = True, save_slices: bool = True, 
+                     custom_slices: Dict[str, List[int]] = None):
         os.makedirs(output_dir, exist_ok=True)
         
         print("Running reconstruction...")
         recon_volume = self.reconstruct()
         
-        # 计算指标
         metrics = evaluate_reconstruction(recon_volume, self.target_image, compute_3d_ssim=True)
         zf_metrics = evaluate_reconstruction(self.zero_filled, self.target_image, compute_3d_ssim=True)
         
         print("\n" + "="*50)
-        print("  Final Results")
-        print("="*50)
-        print(f"Original (GT) vs Zero-Filled (Input) vs 3DGSMR (Output)")
         print(f"PSNR: {zf_metrics['psnr']:.2f} -> {metrics['psnr']:.2f} dB")
         print(f"SSIM: {zf_metrics['ssim']:.4f} -> {metrics['ssim']:.4f}")
         print("="*50)
         
-        # 保存指标
         with open(os.path.join(output_dir, 'metrics.yaml'), 'w') as f:
             yaml.dump({'3dgsmr': metrics, 'zero_filled': zf_metrics}, f)
 
-        # 准备保存的数据 (转换为 numpy)
         recon_np = recon_volume.detach().cpu().numpy()
         target_np = self.target_image.detach().cpu().numpy()
         zf_np = self.zero_filled.detach().cpu().numpy()
+        mask_np = self.mask.detach().cpu().numpy() # Mask 也转为 numpy
         
         if save_volume:
             print(f"\nSaving volumes to {output_dir} ...")
-            # 1. 保存为 .npy (复数数据)
             np.save(os.path.join(output_dir, 'reconstruction.npy'), recon_np)
             np.save(os.path.join(output_dir, 'target.npy'), target_np)
             np.save(os.path.join(output_dir, 'zero_filled.npy'), zf_np)
             
-            # 2. 保存为 .nii.gz (幅度图，医学通用格式)
             if HAS_NIBABEL:
                 self._save_nifti(np.abs(recon_np), os.path.join(output_dir, 'reconstruction.nii.gz'))
                 self._save_nifti(np.abs(target_np), os.path.join(output_dir, 'target.nii.gz'))
                 self._save_nifti(np.abs(zf_np), os.path.join(output_dir, 'zero_filled.nii.gz'))
-                print("Saved .nii.gz files for visualization.")
+                # 保存 mask 的 nifti，通常看幅度即可 (0或1)
+                self._save_nifti(np.abs(mask_np), os.path.join(output_dir, 'mask.nii.gz'))
         
         if save_slices:
             print("Generating comparison slices...")
-            self._save_comparison_slices(target_np, zf_np, recon_np, output_dir)
+            self._save_comparison_slices(target_np, zf_np, recon_np, mask_np, output_dir, custom_slices)
             
     def _save_nifti(self, volume_abs, path):
         img = nib.Nifti1Image(volume_abs, np.eye(4))
         nib.save(img, path)
 
-    def _save_comparison_slices(self, target, zf, recon, output_dir):
-        """生成三图对比切片: GT | Zero-Filled | Recon"""
+    def _save_comparison_slices(self, target, zf, recon, mask, output_dir, custom_slices=None):
+        """生成四图对比切片: GT | Zero-Filled | Recon | Mask"""
         try:
             import matplotlib
             matplotlib.use('Agg')
@@ -197,30 +189,44 @@ class GaussianTester:
         t_mag = np.abs(target)
         z_mag = np.abs(zf)
         r_mag = np.abs(recon)
+        m_mag = np.abs(mask)
         
         vmax = np.percentile(t_mag, 99.9)
         D, H, W = t_mag.shape
         
+        # 确定切片索引：Args > Config > Default(Center)
+        slices_cfg = self.config.get('test', {}).get('slices', {})
+        
+        def get_indices(dim_name, max_dim, arg_val):
+            if arg_val is not None: return arg_val
+            if dim_name in slices_cfg: return slices_cfg[dim_name]
+            return [max_dim // 2] # Fallback to center
+            
         slices_map = {
-            'Axial': (0, [D//3, D//2, 2*D//3]),
-            'Coronal': (1, [H//3, H//2, 2*H//3]),
-            'Sagittal': (2, [W//3, W//2, 2*W//3])
+            'Axial': (0, get_indices('axial', D, custom_slices.get('axial') if custom_slices else None)),
+            'Coronal': (1, get_indices('coronal', H, custom_slices.get('coronal') if custom_slices else None)),
+            'Sagittal': (2, get_indices('sagittal', W, custom_slices.get('sagittal') if custom_slices else None))
         }
         
         for view_name, (dim, idxs) in slices_map.items():
             for idx in idxs:
-                if dim == 0:
-                    imgs = [t_mag[idx,:,:], z_mag[idx,:,:], r_mag[idx,:,:]]
-                elif dim == 1:
-                    imgs = [t_mag[:,idx,:], z_mag[:,idx,:], r_mag[:,idx,:]]
-                else:
-                    imgs = [t_mag[:,:,idx], z_mag[:,:,idx], r_mag[:,:,idx]]
+                if idx >= target.shape[dim]: continue
                 
-                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-                titles = ['Original (GT)', 'Undersampled (ZF)', 'Reconstruction']
+                if dim == 0:
+                    imgs = [t_mag[idx,:,:], z_mag[idx,:,:], r_mag[idx,:,:], m_mag[idx,:,:]]
+                elif dim == 1:
+                    imgs = [t_mag[:,idx,:], z_mag[:,idx,:], r_mag[:,idx,:], m_mag[:,idx,:]]
+                else:
+                    imgs = [t_mag[:,:,idx], z_mag[:,:,idx], r_mag[:,:,idx], m_mag[:,:,idx]]
+                
+                # 修改为 1行4列
+                fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+                titles = ['Original (GT)', 'Undersampled (ZF)', 'Reconstruction', 'K-Space Mask']
                 
                 for ax, img, title in zip(axes, imgs, titles):
-                    ax.imshow(img, cmap='gray', vmin=0, vmax=vmax)
+                    # Mask 显示 0-1
+                    v_lim = 1.0 if title == 'K-Space Mask' else vmax
+                    ax.imshow(img, cmap='gray', vmin=0, vmax=v_lim)
                     ax.set_title(title)
                     ax.axis('off')
                 
@@ -231,31 +237,20 @@ class GaussianTester:
         print(f"Saved slice comparisons to {slice_dir}")
 
 def main():
-    set_seed(42)  
-    print(f"Random Seed set to: 42 (Synced with Training)")
     args = parse_args()
     
-    # --- 修改部分：路径构建逻辑 ---
-    # 1. 路径
-    base_project_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+    # 强制同步种子
+    set_seed(args.seed)
     
-    # 2. 处理加速倍数显示 (2.0 -> 2, 2.5 -> 2.5)
+    # 路径逻辑 (Task 2: Testing output)
+    # 这里的 test.py 主要用于单独手动运行，自动测试在 train.py 中调用
+    base_project_path = "/data/data54/wanghaobo/3DGS/3dgsVC"
     acc_tag = int(args.acceleration) if args.acceleration.is_integer() else args.acceleration
+    output_folder_name = f"test_results_{acc_tag}x" # 默认输出
     
-    # 3. 自动生成输出文件夹名
-    output_folder_name = f"test_results_{acc_tag}x"
+    # 允许输出到当前目录（如果手动跑可能希望自己定义，这里保持简单逻辑）
     save_dir = os.path.join(base_project_path, output_folder_name)
     
-    # 打印配置确认
-    print("-" * 40)
-    print(f"Start Testing...")
-    print(f"Dataset      : {args.dataset}")
-    print(f"Weights      : {args.weights}")
-    print(f"Acceleration : {args.acceleration}x")
-    print(f"Output Dir   : {save_dir}")
-    print("-" * 40)
-
-    # 设备设置
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
         device = torch.device(f'cuda:{args.gpu}')
@@ -267,17 +262,22 @@ def main():
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
             
-    # 初始化 Tester (传入新的 dataset 和 acceleration 参数)
     tester = GaussianTester(
-        checkpoint_path=args.weights,  # 使用 weights 参数
+        checkpoint_path=args.weights,
         config=config, 
         device=device, 
-        data_path=args.dataset,        # 使用 dataset 参数
-        acceleration_override=args.acceleration # 传入加速倍数
+        data_path=args.dataset,
+        acceleration_override=args.acceleration
     )
     
-    # 执行保存
-    tester.save_results(save_dir, args.save_volume, args.save_slices)
+    # 收集自定义切片参数
+    custom_slices = {
+        'axial': args.slices_axial,
+        'coronal': args.slices_coronal,
+        'sagittal': args.slices_sagittal
+    }
+    
+    tester.save_results(save_dir, args.save_volume, args.save_slices, custom_slices)
 
 if __name__ == '__main__':
     main()
