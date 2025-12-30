@@ -5,7 +5,7 @@
 
 # Data Configuration
 data:
-  data_path: "/data/data54/wanghaobo/data/ksp_full.h5"
+  data_path: "/data0/congcong/data/MTP_data/ksp_mtp.h5" #"/data0/congcong/data/MTP_data/ksp_mtp.h5"       "/data0/congcong/data/3D_data/h5data/ksp_full.h5"
   acceleration_factor: 4
   mask_type: "gaussian"
   use_acs: true
@@ -56,7 +56,7 @@ loss:
 
 # Output Configuration
 output:
-  output_dir: "./outputs"
+  output_dir: "./MTPoutputs"
   exp_name: "3dgsmr_exp"
   save_nii: true
   save_npy: true

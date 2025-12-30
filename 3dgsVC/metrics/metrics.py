@@ -38,12 +38,18 @@ def compute_psnr(
         pred = pred.detach().cpu()
         if pred.is_complex():
             pred = torch.abs(pred)
+        # Handle [2, D, H, W] case (Real/Imag stacked)
+        elif pred.ndim == 4 and pred.shape[0] == 2:
+            pred = torch.sqrt(pred[0]**2 + pred[1]**2)
         pred = pred.numpy()
     
     if torch.is_tensor(target):
         target = target.detach().cpu()
         if target.is_complex():
             target = torch.abs(target)
+        # Handle [2, D, H, W] case (Real/Imag stacked)
+        elif target.ndim == 4 and target.shape[0] == 2:
+            target = torch.sqrt(target[0]**2 + target[1]**2)
         target = target.numpy()
     
     # 计算MSE
@@ -87,12 +93,18 @@ def compute_ssim(
         pred = pred.detach().cpu()
         if pred.is_complex():
             pred = torch.abs(pred)
+        # Handle [2, D, H, W] case (Real/Imag stacked)
+        elif pred.ndim == 4 and pred.shape[0] == 2:
+            pred = torch.sqrt(pred[0]**2 + pred[1]**2)
         pred = pred.numpy()
     
     if torch.is_tensor(target):
         target = target.detach().cpu()
         if target.is_complex():
             target = torch.abs(target)
+        # Handle [2, D, H, W] case (Real/Imag stacked)
+        elif target.ndim == 4 and target.shape[0] == 2:
+            target = torch.sqrt(target[0]**2 + target[1]**2)
         target = target.numpy()
     
     # 计算数据范围

@@ -7,7 +7,7 @@
 set -e
 
 # ======================= 基础配置 =======================
-PROJECT_ROOT="/data/data54/wanghaobo/3DGS-CE/3DGS/3dgsVC"
+PROJECT_ROOT="/data0/congcong/code/haobo/V3/3DGS/3dgsVC"
 CONFIG="${PROJECT_ROOT}/configs/default.yaml"
 GPU=0
 

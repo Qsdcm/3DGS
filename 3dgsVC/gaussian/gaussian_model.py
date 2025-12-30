@@ -197,13 +197,34 @@ class GaussianModel3D(nn.Module):
 
     @classmethod
     def from_image(cls, image: torch.Tensor, num_points: int, initial_scale: float = 2.0, device: str = "cuda:0"):
-        D, H, W = image.shape
-        mag = torch.abs(image).flatten()
-        threshold = torch.quantile(mag, 0.90)
-        candidates = torch.nonzero(mag > threshold).squeeze()
+        # Handle [2, D, H, W] input
+        if image.ndim == 4 and image.shape[0] == 2:
+            C, D, H, W = image.shape
+            # Compute magnitude for initialization probability
+            mag = torch.sqrt(image[0]**2 + image[1]**2)
+            # Flatten for sampling
+            mag_flat = mag.flatten()
+            
+            # Densities from real/imag parts
+            densities_real = image[0]
+            densities_imag = image[1]
+        else:
+            D, H, W = image.shape
+            mag = torch.abs(image)
+            mag_flat = mag.flatten()
+            
+            if torch.is_complex(image):
+                densities_real = image.real
+                densities_imag = image.imag
+            else:
+                densities_real = image
+                densities_imag = torch.zeros_like(image)
+
+        threshold = torch.quantile(mag_flat, 0.90)
+        candidates = torch.nonzero(mag_flat > threshold).squeeze()
         
         if candidates.numel() < num_points:
-            candidates = torch.arange(mag.numel(), device=device)
+            candidates = torch.arange(mag_flat.numel(), device=device)
         
         indices_idx = torch.randperm(candidates.numel(), device=device)[:num_points]
         indices = candidates[indices_idx]
@@ -229,14 +250,16 @@ class GaussianModel3D(nn.Module):
             scales_init = torch.ones(num_points, 3, device=device) * (2.0/D)
         
         # 密度初始化缩放因子 (Paper Table 1: k=0.15)
-        img_flat = image.reshape(-1)
-        densities = img_flat[indices] * 0.15
+        init_den_r = densities_real.flatten()[indices] * 0.15
+        init_den_i = densities_imag.flatten()[indices] * 0.15
+        
+        initial_densities = torch.complex(init_den_r, init_den_i)
         
         return cls(
             num_points=num_points,
-            volume_shape=image.shape,
+            volume_shape=(D, H, W),
             initial_positions=positions,
-            initial_densities=densities,
+            initial_densities=initial_densities,
             initial_scales=scales_init,
             device=device
         )

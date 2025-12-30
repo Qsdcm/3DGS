@@ -68,6 +68,7 @@ class GaussianTrainer:
         self.volume_shape = data['volume_shape']
         self.target_image = data['ground_truth'].to(self.device)
         self.zero_filled = data['zero_filled'].to(self.device)
+        self.sensitivity_maps = data['sensitivity_maps'].to(self.device)
         
         print(f"Volume shape: {self.volume_shape}")
         print(f"K-space shape: {self.kspace_full.shape}")
@@ -157,14 +158,29 @@ class GaussianTrainer:
         else:
             density = self.gaussian_model.density
         
+        # 1. GS -> Image Domain (Complex)
         volume = self.voxelizer(
             positions=positions,
             scales=scales,
             rotations=rotations,
             density=density
         )
-        kspace = fft3c(volume)
-        return volume, kspace
+        
+        # 2. Forward Model A: Image -> Multi-coil K-space
+        # volume: [D, H, W] (complex)
+        # sensitivity_maps: [Coils, D, H, W] (complex)
+        
+        # Expand volume to coils
+        volume_expanded = volume.unsqueeze(0) * self.sensitivity_maps
+        
+        # FFT to K-space
+        kspace_multicoil = fft3c(volume_expanded)
+        
+        # 3. Split Real/Imag -> [2*Coils, D, H, W]
+        # kspace_multicoil: [Coils, D, H, W]
+        kspace_pred = torch.cat([kspace_multicoil.real, kspace_multicoil.imag], dim=0)
+        
+        return volume, kspace_pred
     
     def compute_gradient_stats(self) -> Dict[str, torch.Tensor]:
         """计算梯度统计信息，增加 mean_grad 用于调试"""

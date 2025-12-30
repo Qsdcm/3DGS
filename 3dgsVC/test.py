@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument('--slices_axial', nargs='+', type=int, help='Slice indices for Axial view (e.g. 50 100 150)')
     parser.add_argument('--slices_coronal', nargs='+', type=int, help='Slice indices for Coronal view')
     parser.add_argument('--slices_sagittal', nargs='+', type=int, help='Slice indices for Sagittal view')
+    parser.add_argument('--output_dir', type=str, default=None, help='Directory to save results')
     
     return parser.parse_args()
 
@@ -186,10 +187,16 @@ class GaussianTester:
         slice_dir = os.path.join(output_dir, 'slices')
         os.makedirs(slice_dir, exist_ok=True)
         
-        t_mag = np.abs(target)
-        z_mag = np.abs(zf)
-        r_mag = np.abs(recon)
-        m_mag = np.abs(mask)
+        # Helper to get magnitude
+        def get_mag(arr):
+            if arr.ndim == 4 and arr.shape[0] == 2:
+                return np.sqrt(arr[0]**2 + arr[1]**2)
+            return np.abs(arr)
+
+        t_mag = get_mag(target)
+        z_mag = get_mag(zf)
+        r_mag = get_mag(recon)
+        m_mag = get_mag(mask)
         
         vmax = np.percentile(t_mag, 99.9)
         D, H, W = t_mag.shape
@@ -243,13 +250,15 @@ def main():
     set_seed(args.seed)
     
     # 路径逻辑 (Task 2: Testing output)
-    # 这里的 test.py 主要用于单独手动运行，自动测试在 train.py 中调用
-    base_project_path = "/data/data54/wanghaobo/3DGS/3dgsVC"
-    acc_tag = int(args.acceleration) if args.acceleration.is_integer() else args.acceleration
-    output_folder_name = f"test_results_{acc_tag}x" # 默认输出
-    
-    # 允许输出到当前目录（如果手动跑可能希望自己定义，这里保持简单逻辑）
-    save_dir = os.path.join(base_project_path, output_folder_name)
+    if args.output_dir:
+        save_dir = args.output_dir
+    else:
+        # 默认保存到 weights 所在目录的上级目录下的 test_results
+        # e.g. .../exp_name/checkpoints/best.pth -> .../exp_name/test_results_8x
+        weights_dir = os.path.dirname(args.weights)
+        exp_dir = os.path.dirname(weights_dir)
+        acc_tag = int(args.acceleration) if args.acceleration.is_integer() else args.acceleration
+        save_dir = os.path.join(exp_dir, f"test_results_{acc_tag}x")
     
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)

@@ -173,10 +173,41 @@ class MRIDataset(Dataset):
         
     def _apply_undersampling(self):
         """应用欠采样并生成Zero-filled图像"""
-        self.kspace_undersampled = self.kspace_full * self.mask
-        self.zero_filled_image = ifft3c(self.kspace_undersampled)
+        # mask shape: (kx, ky, kz)
+        # kspace_multicoil shape: (coils, kx, ky, kz)
+        
+        # Expand mask for coils
+        mask_expanded = self.mask.unsqueeze(0)
+        
+        # Undersampled multi-coil k-space
+        kspace_undersampled_complex = self.kspace_multicoil * mask_expanded
+        
+        # Zero-filled reconstruction (SENSE-1 like)
+        # sum(conj(csm) * ifft3d(x), chan)
+        image_multicoil = ifft3c(kspace_undersampled_complex)
+        zero_filled_complex = torch.sum(
+            torch.conj(self.sensitivity_maps) * image_multicoil,
+            dim=0
+        ) # (kx, ky, kz)
+        
+        # Prepare outputs in user specified format
+        # Zero-filled: [2, kx, ky, kz]
+        self.zero_filled_image = torch.stack([
+            zero_filled_complex.real,
+            zero_filled_complex.imag
+        ], dim=0)
+        
+        # K-space undersampled: [2*coils, kx, ky, kz]
+        # User said [24, ...], assuming 12 coils.
+        # kspace_undersampled_complex is (coils, kx, ky, kz)
+        self.kspace_undersampled = torch.cat([
+            kspace_undersampled_complex.real,
+            kspace_undersampled_complex.imag
+        ], dim=0)
         
         print(f"Applied undersampling. Non-zero ratio: {self.mask.sum()/self.mask.numel():.4f}")
+        print(f"Zero-filled shape: {self.zero_filled_image.shape}")
+        print(f"Undersampled k-space shape: {self.kspace_undersampled.shape}")
         
     def get_data(self) -> Dict[str, torch.Tensor]:
         return {
