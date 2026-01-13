@@ -5,9 +5,9 @@
 
 # Data Configuration
 data:
-  data_path: "/data0/congcong/data/MTP_data/ksp_mtp.h5" #"/data0/congcong/data/MTP_data/ksp_mtp.h5"       "/data0/congcong/data/3D_data/h5data/ksp_full.h5"
+  data_path: "/data0/congcong/data/3D_data/h5data/ksp_full.h5" #"/data0/congcong/data/MTP_data/ksp_mtp.h5"       "/data0/congcong/data/3D_data/h5data/ksp_full.h5"
   acceleration_factor: 4
-  mask_type: "gaussian"
+  mask_type: "poisson"
   use_acs: true
   acs_lines: 32
 
@@ -51,12 +51,12 @@ training:
 loss:
   kspace_weight: 1.0
   image_weight: 0.0
-  tv_weight: 0.0
+  tv_weight: 0.0001
   loss_type: "l2"
 
 # Output Configuration
 output:
-  output_dir: "./MTPoutputs"
+  output_dir: "./outputs"
   exp_name: "3dgsmr_exp"
   save_nii: true
   save_npy: true

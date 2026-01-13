@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ExponentialLR, CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from typing import Dict, Optional, Tuple, Any
 from tqdm import tqdm
@@ -141,6 +142,11 @@ class GaussianTrainer:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.result_dir, exist_ok=True)
         
+        if self.config['output'].get('use_tensorboard', True):
+            self.writer = SummaryWriter(log_dir=os.path.join(self.output_dir, 'logs'))
+        else:
+            self.writer = None
+
         config_path = os.path.join(self.output_dir, 'config.yaml')
         with open(config_path, 'w') as f:
             yaml.dump(self.config, f, default_flow_style=False)
@@ -365,7 +371,11 @@ class GaussianTrainer:
             torch.save(checkpoint, best_path)
         
         save_every = self.config['training'].get('save_every', 500)
-        if iteration % save_every == 0:
+        
+        # Custom checkpoints list
+        custom_checkpoints = [10, 50, 100, 300, 600, 800, 1000, 1200]
+        
+        if iteration % save_every == 0 or iteration in custom_checkpoints:
             iter_path = os.path.join(self.checkpoint_dir, f'checkpoint_{iteration:06d}.pth')
             torch.save(checkpoint, iter_path)
     
@@ -425,6 +435,11 @@ class GaussianTrainer:
                     'grad': f"{mean_grad:.2e}",             # 监控梯度是否 > 0.0002
                     'n_pts': self.gaussian_model.num_points
                 })
+                
+                if self.writer:
+                    self.writer.add_scalar('Loss/total_loss', loss_dict['total_loss'], iteration)
+                    self.writer.add_scalar('Stats/num_points', self.gaussian_model.num_points, iteration)
+                    self.writer.add_scalar('Stats/mean_grad', mean_grad, iteration)
             
             if iteration % eval_every == 0 or iteration == max_iterations - 1:
                 metrics = self.evaluate()
@@ -433,6 +448,10 @@ class GaussianTrainer:
                     self.best_psnr = metrics['psnr']
                     self.best_ssim = metrics['ssim']
                 
+                if self.writer:
+                    self.writer.add_scalar('Metrics/PSNR', metrics['psnr'], iteration)
+                    self.writer.add_scalar('Metrics/SSIM', metrics['ssim'], iteration)
+
                 print(f"\n[Iter {iteration}] PSNR: {metrics['psnr']:.2f} dB, SSIM: {metrics['ssim']:.4f}")
                 
                 # 打印分裂详情

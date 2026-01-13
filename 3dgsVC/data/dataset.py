@@ -140,8 +140,23 @@ class MRIDataset(Dataset):
         return mask_3d
     
     def _generate_poisson_mask(self, shape: Tuple[int, ...]) -> torch.Tensor:
-        """生成Poisson mask (此处简化为Random，如需严格Poisson需额外算法)"""
-        return self._generate_random_mask(shape)
+        """
+        生成Poisson-Disc mask (Variable Density) - Imitating vdPoisMex
+        使用 Variable Density Poisson Disc Sampling 算法
+        """
+        from .mask_generator import gen_poisson_mask
+        kx, ky, kz = shape
+        
+        # Generate 2D mask using the Poisson Disc algorithm
+        # Returns shape (ky, kz)
+        mask_2d_np = gen_poisson_mask((ky, kz), self.acceleration_factor, self.acs_lines)
+        
+        mask_2d = torch.from_numpy(mask_2d_np).float()
+        
+        # Expand to 3D (kx is fully sampled)
+        mask_3d = mask_2d.unsqueeze(0).expand(kx, ky, kz)
+        
+        return mask_3d
     
     def _generate_random_mask(self, shape: Tuple[int, ...]) -> torch.Tensor:
         """生成随机欠采样mask (2D Phase Encoding)"""

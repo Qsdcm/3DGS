@@ -15,7 +15,7 @@ class Voxelizer(nn.Module):
         scales: torch.Tensor,    # (N, 3)
         rotations: torch.Tensor, # (N, 4)
         density: torch.Tensor,   # (N,)
-        chunk_size: int = 256    # 关键修改: 降至256，配合排序策略极省显存
+        chunk_size: int = 4096   # 优化: 增大 chunk_size 以利用 GPU 并行能力
     ) -> torch.Tensor:
         D, H, W = self.volume_shape
         device = self.device
@@ -47,7 +47,8 @@ class Voxelizer(nn.Module):
         S_inv = torch.reciprocal(scales_sorted + 1e-8)
         L = R * S_inv.unsqueeze(1)
         cov_inv_sorted = L @ L.transpose(1, 2) # (N, 3, 3)
-        
+
+
         # 初始化空白 Volume
         volume_flat = torch.zeros(D * H * W, dtype=torch.complex64, device=device)
         
