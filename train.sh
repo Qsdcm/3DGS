@@ -1,6 +1,6 @@
 bash scripts/train.sh \
-    --acceleration 20 \
-    --gpu 4  \
+    --acceleration 19 \
+    --gpu 2  \
     --max_iterations 3000  \
     --initial_points 500 \
     --slices_axial "50 100 150" \

@@ -182,6 +182,44 @@ def main():
     else:
         print(f"Error: Best checkpoint not found at {best_checkpoint_path}")
 
+    # 7. 对 custom_checkpoints 逐个自动测试
+    custom_checkpoints = config.get('training', {}).get(
+        'custom_checkpoints',
+        [10, 50, 100, 300, 600, 800, 1000, 1200]
+    )
+    # 只测试训练范围内的步数
+    max_iters = config.get('training', {}).get('max_iterations', None)
+    if max_iters is not None:
+        custom_checkpoints = [ckpt for ckpt in custom_checkpoints if ckpt < max_iters]
+
+    if len(custom_checkpoints) > 0:
+        print("\n" + "=" * 50)
+        print("Starting Automatic Testing (Custom Checkpoints)")
+        print("=" * 50)
+
+    for step in custom_checkpoints:
+        ckpt_path = os.path.join(full_output_dir, 'checkpoints', f'checkpoint_{step:06d}.pth')
+        step_output_dir = os.path.join(full_output_dir, f'test_results_{step}')
+
+        if not os.path.exists(ckpt_path):
+            print(f"[Skip] Checkpoint not found: {ckpt_path}")
+            continue
+
+        tester = GaussianTester(
+            checkpoint_path=ckpt_path,
+            config=config,
+            device=device,
+            data_path=config['data']['data_path'],
+            acceleration_override=acc
+        )
+        tester.save_results(
+            output_dir=step_output_dir,
+            save_volume=True,
+            save_slices=True,
+            custom_slices=custom_slices
+        )
+        print(f"Custom checkpoint testing completed: step={step} -> {step_output_dir}")
+
 
 if __name__ == '__main__':
     main()

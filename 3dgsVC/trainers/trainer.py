@@ -371,9 +371,10 @@ class GaussianTrainer:
             torch.save(checkpoint, best_path)
         
         save_every = self.config['training'].get('save_every', 500)
-        
-        # Custom checkpoints list
-        custom_checkpoints = [10, 50, 100, 300, 600, 800, 1000, 1200]
+        custom_checkpoints = self.config['training'].get(
+            'custom_checkpoints',
+            [10, 50, 100, 300, 600, 800, 1000, 1200]
+        )
         
         if iteration % save_every == 0 or iteration in custom_checkpoints:
             iter_path = os.path.join(self.checkpoint_dir, f'checkpoint_{iteration:06d}.pth')
@@ -405,6 +406,11 @@ class GaussianTrainer:
         max_iterations = train_config['max_iterations']
         eval_every = train_config.get('eval_every', 100)
         log_every = train_config.get('log_every', 50)
+        save_every = train_config.get('save_every', 500)
+        custom_checkpoints = train_config.get(
+            'custom_checkpoints',
+            [10, 50, 100, 300, 600, 800, 1000, 1200]
+        )
         
         if resume_from is not None:
             self.load_checkpoint(resume_from)
@@ -461,6 +467,10 @@ class GaussianTrainer:
                 print(f"  Num Gaussians: {self.gaussian_model.num_points}")
                 
                 self.save_checkpoint(iteration, is_best)
+            else:
+                # 确保自定义检查点/固定间隔检查点一定会被保存
+                if (iteration % save_every == 0) or (iteration in custom_checkpoints):
+                    self.save_checkpoint(iteration, is_best=False)
         
         print("\n" + "=" * 50)
         print("Training completed!")
